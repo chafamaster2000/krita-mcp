@@ -1,24 +1,64 @@
-# Krita MCP Server
+# Krita MCP Server — AI Diffusion Bridge Fork
 
-Let AI paint in [Krita](https://krita.org/) via the [Model Context Protocol](https://modelcontextprotocol.io/).
+> Fork of [nanayax3/krita-mcp](https://github.com/nanayax3/krita-mcp) that adds a live
+> bridge to [Acly/krita-ai-diffusion](https://github.com/Acly/krita-ai-diffusion).
+> An MCP client can now drive AI image generation end-to-end from inside Krita:
+> set prompts, switch styles, create regions, draw silhouette masks, generate,
+> review results, and apply them — all without touching Krita's UI.
 
-This bridge allows Claude (or any MCP client) to create canvases, paint strokes, draw shapes, export images, and more — all inside a running Krita instance.
+This bridge allows Claude (or any MCP client) to create canvases, paint strokes,
+draw shapes, export images, **and now drive Krita AI Diffusion's full generation
+pipeline** — all inside a running Krita instance.
+
+## What This Fork Adds
+
+The upstream `nanayax3/krita-mcp` exposes Krita's painting primitives (canvas,
+brush, stroke, fill, shape, export). This fork keeps every existing tool intact
+and adds a second surface that bridges to the AI Diffusion plugin running in the
+same Krita process. The plugin imports `ai_diffusion.model.root` directly and
+calls its API on Krita's main thread.
+
+**Why this works without patching AI Diffusion:** the `kritamcp` plugin and the
+`ai_diffusion` plugin both run inside Krita's embedded Python interpreter. Once
+both are loaded, `kritamcp` can `from ai_diffusion.model.root import root` and
+manipulate the live `Model` object that AI Diffusion uses internally. No fork
+of the AI Diffusion plugin is needed.
+
+13 new MCP tools are exposed (`krita_ai_*`). The original painting tools
+are unchanged.
 
 ## How It Works
 
 Two components:
 
-1. **Krita Plugin** (`krita-plugin/`) — A Python plugin that runs inside Krita, exposing an HTTP server on `localhost:5678`. It receives paint commands and executes them on Krita's main thread via a command queue.
+1. **Krita Plugin** (`krita-plugin/`) — A Python plugin that runs inside Krita,
+   exposing an HTTP server on `localhost:5678`. It receives commands and executes
+   them on Krita's main thread via a command queue. New handlers (`cmd_ai_*`)
+   bridge to the AI Diffusion plugin's internal API.
 
-2. **MCP Server** (`server.py`) — A [FastMCP](https://github.com/jlowin/fastmcp) server that exposes painting tools to any MCP client. It translates MCP tool calls into HTTP requests to the Krita plugin.
+2. **MCP Server** (`server.py`) — A [FastMCP](https://github.com/jlowin/fastmcp)
+   server that exposes tools to any MCP client. Translates MCP tool calls into
+   HTTP requests to the Krita plugin.
 
 ```
-MCP Client (Claude, etc.)  ←→  MCP Server (server.py)  ←→  Krita Plugin (HTTP on :5678)  ←→  Krita
+MCP Client (Claude, etc.)  ←→  MCP Server (server.py)  ←→  Krita Plugin (HTTP :5678)
+                                                              │
+                                                              ↓ (in-process import)
+                                                          AI Diffusion plugin
+                                                              │
+                                                              ↓
+                                                          ComfyUI backend
 ```
 
 ## Setup
 
-### 1. Install the Krita Plugin
+### 1. Install Krita AI Diffusion (required for the AI tools)
+
+Follow the install guide at https://github.com/Acly/krita-ai-diffusion. The
+plugin must be installed and the ComfyUI backend reachable. Without it, the
+`krita_ai_*` tools will return an error but the painting tools still work.
+
+### 2. Install the Krita MCP Plugin
 
 Copy the plugin files to your Krita plugins directory:
 
@@ -32,9 +72,10 @@ Copy both:
 - `krita-plugin/kritamcp/` (the folder with `__init__.py`)
 - `krita-plugin/kritamcp.desktop`
 
-Then in Krita: **Settings → Configure Krita → Python Plugin Manager → Enable "Krita MCP Bridge"** and restart Krita.
+Then in Krita: **Settings → Configure Krita → Python Plugin Manager → Enable
+"Krita MCP Bridge"** and restart Krita.
 
-### 2. Install the MCP Server
+### 3. Install the MCP Server
 
 ```bash
 pip install fastmcp httpx
@@ -47,7 +88,7 @@ source .venv/bin/activate  # or .venv\Scripts\activate on Windows
 pip install -r requirements.txt
 ```
 
-### 3. Configure Your MCP Client
+### 4. Configure Your MCP Client
 
 Add to your MCP client config (e.g., Claude Desktop's `claude_desktop_config.json`):
 
@@ -62,19 +103,11 @@ Add to your MCP client config (e.g., Claude Desktop's `claude_desktop_config.jso
 }
 ```
 
-If using a virtual environment:
-```json
-{
-  "mcpServers": {
-    "krita": {
-      "command": "/path/to/.venv/Scripts/python",
-      "args": ["/path/to/server.py"]
-    }
-  }
-}
-```
+If using a virtual environment, point `command` at the venv's Python.
 
 ## Available Tools
+
+### Original Painting Tools (from upstream)
 
 | Tool | Description |
 |------|-------------|
@@ -85,38 +118,100 @@ If using a virtual environment:
 | `krita_stroke` | Paint a stroke through a list of [x, y] points |
 | `krita_fill` | Fill a circular area at a point |
 | `krita_draw_shape` | Draw rectangle, ellipse, or line |
-| `krita_get_canvas` | Export canvas to PNG (for AI to see progress) |
+| `krita_get_canvas` | Export canvas to PNG (for the AI to see progress) |
 | `krita_save` | Save canvas to a specific file path |
 | `krita_undo` / `krita_redo` | Undo/redo actions |
 | `krita_clear` | Clear canvas to a solid color |
 | `krita_get_color_at` | Eyedropper — sample color at a pixel |
 | `krita_list_brushes` | List available brush presets |
-| `krita_open_file` | Open an existing .kra, .png, .jpg, etc. |
+| `krita_open_file` | Open an existing `.kra`, `.png`, `.jpg`, etc. |
 
-## The Export Timeout Fix
+### AI Diffusion Bridge (new in this fork)
 
-**This is the main reason this repo exists.**
+| Tool | Description |
+|------|-------------|
+| `krita_ai_status` | Server connection, active document, workspace, current style/strength/seed, queue counts, current prompt |
+| `krita_ai_list_styles` | List available AI Diffusion style presets (filter, limit) |
+| `krita_ai_set_prompt` | Set positive/negative prompt on the active region (or root) |
+| `krita_ai_set_params` | Set style, strength, seed, fixed_seed, batch_count |
+| `krita_ai_set_workspace` | Switch workspace: `generation` / `upscaling` / `live` / `animation` / `custom` |
+| `krita_ai_generate` | Trigger generation in the current workspace |
+| `krita_ai_list_jobs` | List jobs newest-first with id, state, prompt, result count |
+| `krita_ai_apply` | Apply a finished job's result to the canvas (job_id optional → latest) |
+| `krita_ai_cancel` | Cancel active and/or queued jobs |
+| `krita_ai_save_preview` | Save a generated image to disk without applying (for review) |
+| `krita_ai_create_region` | Create a new region linked to a fresh paint layer; activates the layer for mask painting |
+| `krita_ai_list_regions` | List root prompt + all child regions with their layer ids and prompts |
+| `krita_ai_select_region` | Select a region by index or layer_id (no args = root) |
+| `krita_ai_remove_region` | Remove a region by index |
 
-By default, HTTP requests and command queue operations time out after ~30 seconds. Canvas export (`get_canvas`) and file save (`save`) operations can easily exceed this on larger canvases, causing silent failures or timeout errors.
+## Region Workflow Example
 
-The fix is applied in two places:
+The canonical loop for region-based generation:
 
-**MCP Server (`server.py`)** — Extended timeout for export/save commands:
-```python
-# In krita_get_canvas and krita_save:
-result = send_command("get_canvas", {"filename": filename}, timeout=120.0)
-result = send_command("save", {"path": path}, timeout=120.0)
+```text
+1. krita_new_canvas(1024, 1024, "#ffffff")
+2. krita_ai_set_params(style="cinematic-photo-xl")
+3. krita_ai_set_prompt(positive="snowy mountain landscape, golden hour")
+4. krita_ai_create_region(positive="grizzly bear standing on snow")
+   → activates a fresh transparent paint layer
+5. krita_set_color("#6b4226")
+6. krita_draw_shape(shape="ellipse", x=70, y=520, width=420, height=320)
+   ... draw rest of bear silhouette on the region's layer
+7. krita_ai_create_region(positive="timber wolf, alert, side profile")
+   → activates a second fresh layer
+8. ... draw wolf silhouette
+9. krita_ai_select_region()      # deselect → root active
+10. krita_ai_generate()
+11. krita_ai_list_jobs()         # wait until state == "finished"
+12. krita_ai_save_preview(job_id="...") + Read the PNG to review
+13. krita_ai_apply(job_id="...")
 ```
 
-**Krita Plugin (`__init__.py`)** — Matching timeout in the command queue:
-```python
-def get_result(self, command_id, timeout=120):
-    """Wait for result with timeout."""
-    for _ in range(int(timeout * 10)):  # Check every 100ms
-        ...
-```
+### Tips Learned the Hard Way
 
-**Both sides must match.** If only the MCP server timeout is increased, the plugin's command queue will still time out at 30s. If only the plugin timeout is increased, the HTTP request from the MCP server will time out first.
+- **`create_region` forces a NEW empty paint layer** in this fork. Upstream
+  AI Diffusion's `create_region` heuristic links the active layer if it happens
+  to be a paint layer — which means linking the fully opaque canvas layer and
+  making the region cover everything. The bridge bypasses that and always
+  creates a fresh transparent layer for the silhouette mask.
+
+- **Region size matters.** The doc says "ensure adequate size." In practice
+  small silhouettes (under ~15% of the canvas) get ignored by the model. Aim
+  for clearly distinct, sizable zones.
+
+- **Two regions is reliable, three+ is fragile.** SDXL with two well-separated
+  regions hit 2/2 consistently in testing. Three regions dropped to 1–2/3 hits.
+  Per the AI Diffusion handbook, regions "are NOT a tool for composition" — they
+  constrain prompts to areas but don't force subjects to appear. For strict
+  multi-subject composition you need Control Layers (scribble / line-art /
+  depth), which this bridge does not currently expose.
+
+- **Root prompt is appended to every region prompt.** Keep root short and
+  scene-level (style, mood, lighting) rather than describing the background in
+  full. Strong scene description in root competes with region prompts and can
+  make Flux-class models ignore the regions.
+
+- **Model choice matters more than expected.** In multi-region tests,
+  SDXL-class models (Juggernaut, Cinematic Photo XL, ZavyChroma) gave the
+  most reliable per-region adherence. Turbo / 1-step models (Z-Image Turbo)
+  effectively skip regional conditioning. Flux variants are too prompt-literal
+  with a strong root prompt and tend to render only the global scene.
+
+- **Img2img refine via strength < 1.0.** When `strength` is below 1.0 the
+  workflow switches to refine — the existing canvas is used as the img2img
+  source. Useful for style-transferring an existing image (set
+  `style="digital-artwork-xl"`, `strength=0.6`, set a new prompt, generate).
+
+## The Export Timeout Fix (from upstream)
+
+By default HTTP requests and command queue operations time out after ~30 seconds.
+Canvas export (`get_canvas`) and file save (`save`) operations can easily exceed
+this on larger canvases. Both sides — MCP server timeout and plugin command queue
+timeout — are bumped to 120s.
+
+If you build new commands that can take a long time, remember to pass an
+extended `timeout` to `send_command(...)` on both sides.
 
 ## Configuration
 
@@ -126,16 +221,55 @@ def get_result(self, command_id, timeout=120):
 | MCP server URL | `http://localhost:5678` | Set `KRITA_URL` env var |
 | Canvas output dir | `~/krita-mcp-output` | Edit `CANVAS_OUTPUT_DIR` in plugin `__init__.py` |
 
-## Painting Approach
+Generated previews from `krita_ai_save_preview` and exports from
+`krita_get_canvas` land in `CANVAS_OUTPUT_DIR`.
 
-The plugin paints using **direct pixel manipulation** (not Krita's native brush engine for strokes). This means:
+## Architecture Notes
 
-- Strokes use a custom soft-circle renderer with configurable hardness
-- Alpha blending is done manually in BGRA pixel format
-- Shapes (rectangle, ellipse, line) are rasterized directly
-- This approach is reliable and doesn't depend on Krita's internal brush state
+### Why the bridge is a separate plugin
 
-The `set_brush` tool does set Krita's brush preset (for potential future use), but `stroke` currently uses its own pixel-level rendering.
+It would be cleaner to add MCP support directly into `ai_diffusion` as a
+contributed feature. We chose a separate plugin so that:
+
+- Upstream `ai_diffusion` updates don't require re-applying patches.
+- The bridge can be installed and removed without touching the AI Diffusion
+  installation.
+- Failures on the bridge side never affect normal AI Diffusion UI use.
+
+The trade-off: the bridge imports private-ish internals of `ai_diffusion`
+(`model.root`, `model.regions._regions`, `model.regions._add`). If upstream
+refactors those, the bridge breaks. The imports are localized to
+`kritamcp/__init__.py` so the surface area to update is small.
+
+### Threading
+
+All `cmd_ai_*` handlers run on Krita's Qt main thread via the existing
+`QTimer`-driven command queue. AI Diffusion's `Model` API expects to be called
+on the main thread for document mutation, so this works out naturally without
+extra locking.
+
+### Job lifecycle
+
+`model.generate()` returns synchronously after enqueuing the job. The actual
+generation runs on AI Diffusion's asyncio loop and reports back via signals.
+`krita_ai_list_jobs` polls `model.jobs` to surface state. There is no built-in
+"wait until done" — the MCP client should poll or sleep + re-check, exactly as
+the test suite does.
+
+## Painting Approach (from upstream)
+
+The plugin paints using **direct pixel manipulation** (not Krita's native brush
+engine for strokes). Strokes use a custom soft-circle renderer with configurable
+hardness. Alpha blending is done manually in BGRA pixel format. Shapes
+(rectangle, ellipse, line) are rasterized directly. This approach is reliable
+and doesn't depend on Krita's internal brush state.
+
+## Credits
+
+- Original Krita MCP bridge: [nanayax3/krita-mcp](https://github.com/nanayax3/krita-mcp)
+- AI Diffusion plugin (not modified, only bridged):
+  [Acly/krita-ai-diffusion](https://github.com/Acly/krita-ai-diffusion)
+- This fork adds the AI Diffusion bridge layer.
 
 ## License
 

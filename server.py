@@ -327,5 +327,235 @@ def krita_open_file(path: str) -> str:
     return f"Opened: {result.get('name', 'unknown')} ({result.get('width')}x{result.get('height')})"
 
 
+# ----- AI Diffusion (Acly/krita-ai-diffusion) tools -----
+# These talk to the AI Diffusion plugin running in the same Krita process via
+# the kritamcp bridge. Require the plugin to be installed and enabled in Krita.
+
+import json as _json
+
+
+def _fmt(result: dict) -> str:
+    """Format a JSON-ish result as compact pretty text for the MCP client.
+
+    Only treats `error` as a failure when it has a truthy value — the AI status
+    payload includes a nullable `error` field for the server connection state.
+    """
+    err = result.get("error")
+    if err:
+        return f"Error: {err}"
+    return _json.dumps(result, indent=2, default=str)
+
+
+@mcp.tool()
+def krita_ai_status() -> str:
+    """
+    Get AI Diffusion plugin status: server connection, active document, workspace,
+    current style/strength/seed, queued/executing/finished job counts, current prompt.
+    """
+    return _fmt(send_command("ai_status"))
+
+
+@mcp.tool()
+def krita_ai_set_prompt(
+    positive: Optional[str] = None,
+    negative: Optional[str] = None,
+) -> str:
+    """
+    Set positive and/or negative prompt for the active document.
+    Positive is written to the active region (or root if no region selected).
+    Negative is always written to the root region.
+
+    Args:
+        positive: Positive prompt text. Omit to leave unchanged.
+        negative: Negative prompt text. Omit to leave unchanged.
+    """
+    params = {}
+    if positive is not None:
+        params["positive"] = positive
+    if negative is not None:
+        params["negative"] = negative
+    if not params:
+        return "Error: provide at least one of positive/negative"
+    return _fmt(send_command("ai_set_prompt", params))
+
+
+@mcp.tool()
+def krita_ai_set_params(
+    style: Optional[str] = None,
+    strength: Optional[float] = None,
+    seed: Optional[int] = None,
+    fixed_seed: Optional[bool] = None,
+    batch_count: Optional[int] = None,
+) -> str:
+    """
+    Set generation parameters.
+
+    Args:
+        style: Style filename or partial name match (see krita_ai_list_styles).
+        strength: 0.0-1.0, denoising strength for img2img / refine workflows.
+        seed: Seed value.
+        fixed_seed: If True, reuse `seed` for every generation instead of randomizing.
+        batch_count: Number of images per generation call.
+    """
+    params = {}
+    for k, v in {
+        "style": style,
+        "strength": strength,
+        "seed": seed,
+        "fixed_seed": fixed_seed,
+        "batch_count": batch_count,
+    }.items():
+        if v is not None:
+            params[k] = v
+    if not params:
+        return "Error: provide at least one parameter"
+    return _fmt(send_command("ai_set_params", params))
+
+
+@mcp.tool()
+def krita_ai_set_workspace(name: str) -> str:
+    """
+    Switch AI Diffusion workspace.
+
+    Args:
+        name: One of "generation", "upscaling", "live", "animation", "custom".
+    """
+    return _fmt(send_command("ai_set_workspace", {"name": name}))
+
+
+@mcp.tool()
+def krita_ai_generate() -> str:
+    """
+    Trigger image generation in the current workspace. Returns immediately;
+    use krita_ai_status or krita_ai_list_jobs to monitor progress.
+    """
+    return _fmt(send_command("ai_generate"))
+
+
+@mcp.tool()
+def krita_ai_list_jobs(state: str = "all", limit: int = 20) -> str:
+    """
+    List jobs from the AI Diffusion queue, newest first.
+
+    Args:
+        state: Filter by state - "all", "queued", "executing", "finished", "cancelled".
+        limit: Max number of jobs to return.
+    """
+    return _fmt(send_command("ai_list_jobs", {"state": state, "limit": limit}))
+
+
+@mcp.tool()
+def krita_ai_apply(job_id: Optional[str] = None, index: int = 0) -> str:
+    """
+    Apply a generated result to the canvas.
+
+    Args:
+        job_id: Job ID to apply. If omitted, applies the latest finished job.
+        index: Which result image from the batch (default 0).
+    """
+    params = {"index": index}
+    if job_id is not None:
+        params["job_id"] = job_id
+    return _fmt(send_command("ai_apply", params))
+
+
+@mcp.tool()
+def krita_ai_cancel(active: bool = True, queued: bool = False) -> str:
+    """
+    Cancel running or queued generation jobs.
+
+    Args:
+        active: Cancel the currently executing job.
+        queued: Cancel all queued (not yet started) jobs.
+    """
+    return _fmt(send_command("ai_cancel", {"active": active, "queued": queued}))
+
+
+@mcp.tool()
+def krita_ai_save_preview(job_id: str, index: int = 0, filename: str = "") -> str:
+    """
+    Save a generated result image (without applying it) so it can be reviewed.
+
+    Args:
+        job_id: Job ID from krita_ai_list_jobs.
+        index: Which result image from the batch (default 0).
+        filename: Output filename. Defaults to preview_<jobid>_<index>.png in the
+                  kritamcp output dir (~/krita-mcp-output).
+    """
+    params = {"job_id": job_id, "index": index}
+    if filename:
+        params["filename"] = filename
+    return _fmt(send_command("ai_save_preview", params))
+
+
+@mcp.tool()
+def krita_ai_list_styles(filter: str = "", limit: int = 30) -> str:
+    """
+    List available AI Diffusion style presets.
+
+    Args:
+        filter: Substring filter on style name or filename.
+        limit: Max styles to return.
+    """
+    return _fmt(send_command("ai_list_styles", {"filter": filter, "limit": limit}))
+
+
+@mcp.tool()
+def krita_ai_create_region(positive: str = "", group: bool = False) -> str:
+    """
+    Create a new AI Diffusion region linked to a fresh paint layer, set its prompt,
+    and activate it so subsequent painting tools (krita_fill, krita_draw_shape,
+    krita_stroke) draw the region's mask.
+
+    The region's content prompt is `positive`. Paint a silhouette / mask on the
+    activated layer to define WHERE this region applies on the canvas.
+
+    Args:
+        positive: Positive prompt for this region (e.g., "a golden retriever, sitting").
+        group: If True, create a layer GROUP for the region. Default False = paint layer only.
+    """
+    return _fmt(send_command("ai_create_region", {"positive": positive, "group": group}))
+
+
+@mcp.tool()
+def krita_ai_list_regions() -> str:
+    """
+    List all regions for the active document: root prompt (positive/negative) plus
+    each child region with its index, prompt, linked layers, and active flag.
+    """
+    return _fmt(send_command("ai_list_regions"))
+
+
+@mcp.tool()
+def krita_ai_select_region(
+    index: Optional[int] = None,
+    layer_id: Optional[str] = None,
+) -> str:
+    """
+    Select an existing region as the active one. Pass nothing to select root region.
+
+    Args:
+        index: Region index from krita_ai_list_regions.
+        layer_id: Layer id linked to the region (alternative to index).
+    """
+    params = {}
+    if index is not None:
+        params["index"] = index
+    if layer_id is not None:
+        params["layer_id"] = layer_id
+    return _fmt(send_command("ai_select_region", params))
+
+
+@mcp.tool()
+def krita_ai_remove_region(index: int) -> str:
+    """
+    Remove a region by index.
+
+    Args:
+        index: Region index from krita_ai_list_regions.
+    """
+    return _fmt(send_command("ai_remove_region", {"index": index}))
+
+
 if __name__ == "__main__":
     mcp.run()

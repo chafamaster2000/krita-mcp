@@ -213,6 +213,34 @@ class KritaMCPExtension(Extension):
                 return self.cmd_list_brushes(params)
             elif action == "open_file":
                 return self.cmd_open_file(params)
+            elif action == "ai_status":
+                return self.cmd_ai_status(params)
+            elif action == "ai_set_prompt":
+                return self.cmd_ai_set_prompt(params)
+            elif action == "ai_set_params":
+                return self.cmd_ai_set_params(params)
+            elif action == "ai_set_workspace":
+                return self.cmd_ai_set_workspace(params)
+            elif action == "ai_generate":
+                return self.cmd_ai_generate(params)
+            elif action == "ai_list_jobs":
+                return self.cmd_ai_list_jobs(params)
+            elif action == "ai_apply":
+                return self.cmd_ai_apply(params)
+            elif action == "ai_cancel":
+                return self.cmd_ai_cancel(params)
+            elif action == "ai_save_preview":
+                return self.cmd_ai_save_preview(params)
+            elif action == "ai_list_styles":
+                return self.cmd_ai_list_styles(params)
+            elif action == "ai_create_region":
+                return self.cmd_ai_create_region(params)
+            elif action == "ai_list_regions":
+                return self.cmd_ai_list_regions(params)
+            elif action == "ai_select_region":
+                return self.cmd_ai_select_region(params)
+            elif action == "ai_remove_region":
+                return self.cmd_ai_remove_region(params)
             else:
                 return {"error": f"Unknown action: {action}"}
 
@@ -745,6 +773,352 @@ class KritaMCPExtension(Extension):
             window.addView(doc)
 
         return {"status": "ok", "path": filepath, "name": doc.name(), "width": doc.width(), "height": doc.height()}
+
+    # ----- AI Diffusion bridge -----
+    # Talks to the Acly/krita-ai-diffusion plugin running in the same Krita process.
+    # All calls happen on the main thread (driven by the QTimer in createActions),
+    # which is what ai_diffusion expects for Document/Model mutations.
+
+    def _ai_get(self):
+        """Lazy import of ai_diffusion to keep kritamcp usable if the plugin is missing."""
+        try:
+            from ai_diffusion.model.root import root
+            from ai_diffusion.model.model import Workspace
+            from ai_diffusion.model.jobs import JobState
+            from ai_diffusion.model.connection import ConnectionState
+            from ai_diffusion.style import Styles
+        except ImportError as e:
+            raise RuntimeError(f"AI Diffusion plugin not loaded: {e}")
+        return {
+            "root": root,
+            "Workspace": Workspace,
+            "JobState": JobState,
+            "ConnectionState": ConnectionState,
+            "Styles": Styles,
+        }
+
+    def _ai_model(self):
+        ai = self._ai_get()
+        model = ai["root"].model_for_active_document()
+        if model is None:
+            raise RuntimeError("No active document — open a document in Krita first")
+        return ai, model
+
+    def cmd_ai_status(self, params):
+        ai = self._ai_get()
+        root = ai["root"]
+        JobState = ai["JobState"]
+        conn = root.connection
+        status = {
+            "connection": conn.state.name,
+            "error": conn.error if getattr(conn, "error", None) else None,
+        }
+        model = root.model_for_active_document()
+        if model is None:
+            status["document"] = None
+            return {"status": "ok", **status}
+        jobs = model.jobs
+        status["document"] = model.document.filename or "(unsaved)"
+        status["workspace"] = model.workspace.name
+        status["style"] = model.style.filename if model.style else None
+        status["strength"] = float(model.strength)
+        status["seed"] = int(model.seed)
+        status["fixed_seed"] = bool(model.fixed_seed)
+        status["batch_count"] = int(model.batch_count)
+        status["queue"] = {
+            "queued": jobs.count(JobState.queued),
+            "executing": jobs.count(JobState.executing),
+            "finished": jobs.count(JobState.finished),
+            "total": len(jobs),
+        }
+        status["prompt"] = {
+            "positive": model.regions.active_or_root.positive,
+            "negative": model.regions.negative,
+        }
+        return {"status": "ok", **status}
+
+    def cmd_ai_set_prompt(self, params):
+        ai, model = self._ai_model()
+        positive = params.get("positive")
+        negative = params.get("negative")
+        target = model.regions.active_or_root
+        applied = {}
+        if positive is not None:
+            target.positive = positive
+            applied["positive_set_on"] = "root" if target is model.regions else "active_region"
+            applied["positive"] = positive
+        if negative is not None:
+            model.regions.negative = negative
+            applied["negative"] = negative
+        return {"status": "ok", "applied": applied}
+
+    def cmd_ai_set_params(self, params):
+        ai, model = self._ai_model()
+        Styles = ai["Styles"]
+        applied = {}
+        style_query = params.get("style")
+        if style_query is not None:
+            styles = Styles.list()
+            found = styles.find(style_query)
+            if found is None:
+                q = style_query.lower()
+                found = next(
+                    (s for s in styles.filtered() if q in s.name.lower() or q in s.filename.lower()),
+                    None,
+                )
+            if found is None:
+                return {"error": f"Style not found: {style_query}"}
+            model.style = found
+            applied["style"] = found.filename
+        if params.get("strength") is not None:
+            model.strength = float(params["strength"])
+            applied["strength"] = model.strength
+        if params.get("seed") is not None:
+            model.seed = int(params["seed"])
+            applied["seed"] = model.seed
+        if params.get("fixed_seed") is not None:
+            model.fixed_seed = bool(params["fixed_seed"])
+            applied["fixed_seed"] = model.fixed_seed
+        if params.get("batch_count") is not None:
+            model.batch_count = int(params["batch_count"])
+            applied["batch_count"] = model.batch_count
+        return {"status": "ok", "applied": applied}
+
+    def cmd_ai_set_workspace(self, params):
+        ai, model = self._ai_model()
+        Workspace = ai["Workspace"]
+        name = params.get("name", "")
+        try:
+            ws = Workspace[name]
+        except KeyError:
+            valid = [w.name for w in Workspace]
+            return {"error": f"Invalid workspace '{name}'. Valid: {valid}"}
+        model.workspace = ws
+        return {"status": "ok", "workspace": ws.name}
+
+    def cmd_ai_generate(self, params):
+        ai, model = self._ai_model()
+        Workspace = ai["Workspace"]
+        ws = model.workspace
+        before = len(model.jobs)
+        if ws is Workspace.generation:
+            model.generate()
+        elif ws is Workspace.upscaling:
+            model.upscale_image()
+        elif ws is Workspace.live:
+            model.generate_live()
+        elif ws is Workspace.animation:
+            model.animation.generate()
+        elif ws is Workspace.custom:
+            model.custom.generate()
+        else:
+            return {"error": f"Unsupported workspace: {ws.name}"}
+        return {
+            "status": "ok",
+            "workspace": ws.name,
+            "jobs_before": before,
+            "jobs_after": len(model.jobs),
+        }
+
+    def cmd_ai_list_jobs(self, params):
+        ai, model = self._ai_model()
+        filter_state = params.get("state", "all")
+        limit = int(params.get("limit", 20))
+        out = []
+        for job in list(model.jobs):
+            if filter_state != "all" and job.state.name != filter_state:
+                continue
+            out.append({
+                "id": job.id,
+                "kind": job.kind.name,
+                "state": job.state.name,
+                "name": job.params.name,
+                "prompt": job.params.prompt,
+                "seed": job.params.seed,
+                "result_count": len(job.results),
+                "timestamp": job.timestamp.isoformat(),
+            })
+        out.reverse()  # newest first
+        return {"status": "ok", "jobs": out[:limit]}
+
+    def cmd_ai_apply(self, params):
+        ai, model = self._ai_model()
+        JobState = ai["JobState"]
+        job_id = params.get("job_id")
+        index = int(params.get("index", 0))
+        if job_id is None:
+            finished = [j for j in model.jobs if j.state is JobState.finished and len(j.results) > 0]
+            if not finished:
+                return {"error": "No finished job to apply"}
+            job = finished[-1]
+            job_id = job.id
+        else:
+            job = model.jobs.find(job_id)
+            if job is None:
+                return {"error": f"Job not found: {job_id}"}
+        if index >= len(job.results):
+            return {"error": f"Index {index} out of range (have {len(job.results)} results)"}
+        model.apply_generated_result(job_id, index)
+        return {"status": "ok", "job_id": job_id, "index": index}
+
+    def cmd_ai_cancel(self, params):
+        ai, model = self._ai_model()
+        active = bool(params.get("active", True))
+        queued = bool(params.get("queued", False))
+        model.cancel(active=active, queued=queued)
+        return {"status": "ok", "active": active, "queued": queued}
+
+    def cmd_ai_save_preview(self, params):
+        ai, model = self._ai_model()
+        job_id = params.get("job_id")
+        if job_id is None:
+            return {"error": "job_id required"}
+        index = int(params.get("index", 0))
+        filename = params.get("filename") or f"preview_{job_id}_{index}.png"
+        if not filename.endswith(".png"):
+            filename += ".png"
+        job = model.jobs.find(job_id)
+        if job is None:
+            return {"error": f"Job not found: {job_id}"}
+        if index >= len(job.results):
+            return {"error": f"Index {index} out of range"}
+        img = job.results[index]
+        filepath = os.path.join(CANVAS_OUTPUT_DIR, filename)
+        img.save(filepath)
+        return {"status": "ok", "path": filepath}
+
+    def cmd_ai_list_styles(self, params):
+        ai = self._ai_get()
+        Styles = ai["Styles"]
+        filter_str = (params.get("filter", "") or "").lower()
+        limit = int(params.get("limit", 30))
+        out = []
+        for s in Styles.list().filtered():
+            if filter_str and filter_str not in s.name.lower() and filter_str not in s.filename.lower():
+                continue
+            out.append({"filename": s.filename, "name": s.name})
+            if len(out) >= limit:
+                break
+        return {"status": "ok", "styles": out}
+
+    def _region_info(self, region):
+        layers = []
+        for l in region.layers:
+            try:
+                layers.append({"id": str(l.id), "name": l.name, "type": l.type.name})
+            except Exception:
+                pass
+        return {
+            "positive": region.positive,
+            "layers": layers,
+            "primary_layer_id": layers[0]["id"] if layers else None,
+        }
+
+    def cmd_ai_create_region(self, params):
+        """Create a new region linked to a freshly created (transparent) paint layer.
+
+        Bypasses ai_diffusion's create_region heuristic — that one tries to link the
+        currently active layer if it's a paint layer, which is wrong when the active
+        layer is a fully opaque canvas (the region's mask would cover everything).
+
+        After creation, the new layer is activated so subsequent painting tools
+        (krita_fill, krita_draw_shape, krita_stroke) draw the region's silhouette mask.
+        """
+        ai, model = self._ai_model()
+        positive = params.get("positive", "")
+        group = bool(params.get("group", False))
+        name_prefix = params.get("name") or f"Region {len(model.regions._regions)}"
+        # Create a fresh, empty paint layer (transparent) — do NOT reuse active.
+        if group:
+            group_layer = model.layers.create_group(name_prefix)
+            paint_layer = model.layers.create("Paint layer", parent=group_layer)
+            link_layer = group_layer
+            active_target = paint_layer
+        else:
+            paint_layer = model.layers.create(name_prefix)
+            link_layer = paint_layer
+            active_target = paint_layer
+        region = model.regions._add(link_layer)
+        if positive:
+            region.positive = positive
+        model.regions.active = region
+        try:
+            model.layers.active = active_target
+        except Exception:
+            pass
+        return {"status": "ok", "region": self._region_info(region)}
+
+    def cmd_ai_list_regions(self, params):
+        ai, model = self._ai_model()
+        root = model.regions
+        active = root.active
+        active_layer = None
+        try:
+            active_layer = root._model.layers.active
+        except Exception:
+            pass
+        regions_out = []
+        for idx, r in enumerate(root._regions):
+            info = self._region_info(r)
+            info["index"] = idx
+            info["is_active"] = (r is active)
+            regions_out.append(info)
+        return {
+            "status": "ok",
+            "root": {
+                "positive": root.positive,
+                "negative": root.negative,
+            },
+            "active_layer_id": str(active_layer.id) if active_layer else None,
+            "regions": regions_out,
+        }
+
+    def cmd_ai_select_region(self, params):
+        """Select an existing region by index or by linked layer_id. Pass null/None to select root."""
+        ai, model = self._ai_model()
+        root = model.regions
+        idx = params.get("index")
+        layer_id = params.get("layer_id")
+        if idx is None and layer_id is None:
+            root.active = None  # root
+            return {"status": "ok", "active": "root"}
+        target_region = None
+        if idx is not None:
+            i = int(idx)
+            if i < 0 or i >= len(root._regions):
+                return {"error": f"Index {i} out of range (have {len(root._regions)} regions)"}
+            target_region = root._regions[i]
+        else:
+            for r in root._regions:
+                if any(str(l.id) == layer_id for l in r.layers):
+                    target_region = r
+                    break
+            if target_region is None:
+                return {"error": f"No region linked to layer_id {layer_id}"}
+        root.active = target_region
+        first = target_region.first_layer
+        if first is not None:
+            try:
+                target = first
+                if hasattr(first, "type") and first.type.name == "group" and first.child_layers:
+                    target = first.child_layers[-1]
+                model.layers.active = target
+            except Exception:
+                pass
+        return {"status": "ok", "active": self._region_info(target_region)}
+
+    def cmd_ai_remove_region(self, params):
+        ai, model = self._ai_model()
+        root = model.regions
+        idx = params.get("index")
+        if idx is None:
+            return {"error": "index required"}
+        i = int(idx)
+        if i < 0 or i >= len(root._regions):
+            return {"error": f"Index {i} out of range"}
+        region = root._regions[i]
+        root.remove(region)
+        return {"status": "ok", "removed_index": i}
 
 
 # Register the extension
