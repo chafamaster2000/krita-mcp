@@ -557,5 +557,94 @@ def krita_ai_remove_region(index: int) -> str:
     return _fmt(send_command("ai_remove_region", {"index": index}))
 
 
+@mcp.tool()
+def krita_ai_add_control(
+    mode: str = "scribble",
+    layer_id: Optional[str] = None,
+    strength: Optional[float] = None,
+    region_index: Optional[int] = None,
+) -> str:
+    """
+    Add a ControlNet / IP-Adapter Control Layer to root (default) or a region.
+    The control sources its image from `layer_id` if provided, otherwise from
+    the currently active Krita layer. ControlNet modes enforce silhouette /
+    structure; IP-Adapter modes extract reference style or composition.
+
+    Modes:
+      Structural (ControlNet — enforces silhouette / structure):
+        scribble, line_art, soft_edge, canny_edge, depth, normal,
+        pose, segmentation, blur, stencil
+      IP-Adapter (extracts from image):
+        reference, style, composition, face
+
+    Args:
+        mode: control mode name (see above).
+        layer_id: optional UUID of source layer. Omit to use active layer.
+        strength: optional 0.0-2.0 control influence. Omit to use preset default.
+        region_index: optional region index. Omit / -1 = root (applies to whole image).
+    """
+    params = {"mode": mode}
+    if layer_id is not None:
+        params["layer_id"] = layer_id
+    if strength is not None:
+        params["strength"] = strength
+    if region_index is not None:
+        params["region_index"] = region_index
+    return _fmt(send_command("ai_add_control", params))
+
+
+@mcp.tool()
+def krita_ai_list_controls(region_index: Optional[int] = None) -> str:
+    """
+    List Control Layers. Without region_index, lists controls across root
+    plus all regions; with region_index (use -1 for root) lists that scope only.
+    """
+    params = {}
+    if region_index is not None:
+        params["region_index"] = region_index
+    return _fmt(send_command("ai_list_controls", params))
+
+
+@mcp.tool()
+def krita_ai_remove_control(index: int, region_index: Optional[int] = None) -> str:
+    """
+    Remove a Control Layer by index from root (default) or a region.
+
+    Args:
+        index: control layer index from krita_ai_list_controls.
+        region_index: optional region index. Omit / -1 = root.
+    """
+    params = {"index": index}
+    if region_index is not None:
+        params["region_index"] = region_index
+    return _fmt(send_command("ai_remove_control", params))
+
+
+@mcp.tool()
+def krita_ai_set_control(
+    index: int,
+    mode: Optional[str] = None,
+    strength: Optional[float] = None,
+    region_index: Optional[int] = None,
+) -> str:
+    """
+    Update mode and/or strength of an existing Control Layer.
+
+    Args:
+        index: control layer index from krita_ai_list_controls.
+        mode: optional new mode (see krita_ai_add_control for valid modes).
+        strength: optional new strength 0.0-2.0.
+        region_index: optional region index. Omit / -1 = root.
+    """
+    params = {"index": index}
+    if mode is not None:
+        params["mode"] = mode
+    if strength is not None:
+        params["strength"] = strength
+    if region_index is not None:
+        params["region_index"] = region_index
+    return _fmt(send_command("ai_set_control", params))
+
+
 if __name__ == "__main__":
     mcp.run()

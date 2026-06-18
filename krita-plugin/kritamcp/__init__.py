@@ -4,7 +4,7 @@ Allows Claude (or any MCP client) to paint by sending commands to this plugin.
 """
 
 from krita import *
-from PyQt5.QtCore import QTimer, QThread, pyqtSignal, QPointF, QRectF
+from PyQt5.QtCore import QTimer, QThread, pyqtSignal, QPointF, QRectF, QUuid
 from PyQt5.QtGui import QColor
 from PyQt5.QtWidgets import QMessageBox
 import json
@@ -241,6 +241,14 @@ class KritaMCPExtension(Extension):
                 return self.cmd_ai_select_region(params)
             elif action == "ai_remove_region":
                 return self.cmd_ai_remove_region(params)
+            elif action == "ai_add_control":
+                return self.cmd_ai_add_control(params)
+            elif action == "ai_list_controls":
+                return self.cmd_ai_list_controls(params)
+            elif action == "ai_remove_control":
+                return self.cmd_ai_remove_control(params)
+            elif action == "ai_set_control":
+                return self.cmd_ai_set_control(params)
             else:
                 return {"error": f"Unknown action: {action}"}
 
@@ -1119,6 +1127,157 @@ class KritaMCPExtension(Extension):
         region = root._regions[i]
         root.remove(region)
         return {"status": "ok", "removed_index": i}
+
+    def _control_info(self, control, index):
+        return {
+            "index": index,
+            "mode": control.mode.name,
+            "layer_id": str(control.layer_id),
+            "strength": control.strength / control.strength_multiplier,
+            "start": control.start,
+            "end": control.end,
+            "is_supported": control.is_supported,
+            "error_text": control.error_text,
+        }
+
+    def _resolve_control_target(self, params):
+        """Return (target, label, model). target is the ControlLayerList of root or region.
+        region_index None or <0 means root."""
+        ai, model = self._ai_model()
+        region_index = params.get("region_index")
+        if region_index is None or int(region_index) < 0:
+            return model.regions, "root", model
+        i = int(region_index)
+        if i < 0 or i >= len(model.regions._regions):
+            return None, None, model
+        return model.regions._regions[i], f"region_{i}", model
+
+    def cmd_ai_add_control(self, params):
+        """Add a Control Layer (ControlNet / IP-Adapter) to root or a region.
+
+        Params:
+          mode: scribble | line_art | soft_edge | canny_edge | depth | normal |
+                pose | segmentation | reference | style | composition | face |
+                blur | stencil
+          layer_id: optional UUID of the layer to use as control source. If omitted,
+                    uses currently active layer.
+          strength: optional 0.0-2.0 control influence (uses preset default if omitted).
+          region_index: optional region index. Omit / -1 = root (whole image).
+        """
+        from ai_diffusion.backend.resources import ControlMode
+
+        target, label, model = self._resolve_control_target(params)
+        if target is None:
+            return {"error": "Region index out of range"}
+
+        mode_name = params.get("mode", "scribble")
+        try:
+            mode = ControlMode[mode_name]
+        except KeyError:
+            valid = ", ".join(m.name for m in ControlMode)
+            return {"error": f"Unknown control mode '{mode_name}'. Valid: {valid}"}
+
+        layer_id = params.get("layer_id")
+        if layer_id:
+            uid = QUuid(layer_id)
+            layer = model.layers.updated().find(uid)
+            if layer is None:
+                return {"error": f"Layer not found: {layer_id}"}
+            try:
+                model.layers.active = layer
+            except Exception as e:
+                return {"error": f"Could not activate layer: {e}"}
+
+        control = target.control.emplace()
+        control.mode = mode
+
+        strength = params.get("strength")
+        if strength is not None:
+            s = float(strength)
+            control.use_custom_strength = True
+            control.strength = int(max(0.0, min(2.0, s)) * control.strength_multiplier)
+
+        idx = len(target.control) - 1
+        return {
+            "status": "ok",
+            "scope": label,
+            "control": self._control_info(control, idx),
+        }
+
+    def cmd_ai_list_controls(self, params):
+        """List Control Layers. If region_index omitted, lists root + all regions."""
+        region_index = params.get("region_index")
+        if region_index is None:
+            ai, model = self._ai_model()
+            out = {
+                "status": "ok",
+                "root": [self._control_info(c, i) for i, c in enumerate(model.regions.control)],
+                "regions": [],
+            }
+            for ri, r in enumerate(model.regions._regions):
+                out["regions"].append({
+                    "index": ri,
+                    "controls": [self._control_info(c, i) for i, c in enumerate(r.control)],
+                })
+            return out
+        target, label, _ = self._resolve_control_target(params)
+        if target is None:
+            return {"error": "Region index out of range"}
+        return {
+            "status": "ok",
+            "scope": label,
+            "controls": [self._control_info(c, i) for i, c in enumerate(target.control)],
+        }
+
+    def cmd_ai_remove_control(self, params):
+        """Remove a Control Layer by index from root or specified region."""
+        target, label, _ = self._resolve_control_target(params)
+        if target is None:
+            return {"error": "Region index out of range"}
+        idx = params.get("index")
+        if idx is None:
+            return {"error": "index required"}
+        i = int(idx)
+        if i < 0 or i >= len(target.control):
+            return {"error": f"Control index {i} out of range"}
+        control = target.control[i]
+        target.control.remove(control)
+        return {"status": "ok", "removed_index": i, "scope": label}
+
+    def cmd_ai_set_control(self, params):
+        """Update mode and/or strength of an existing Control Layer."""
+        from ai_diffusion.backend.resources import ControlMode
+
+        target, label, _ = self._resolve_control_target(params)
+        if target is None:
+            return {"error": "Region index out of range"}
+        idx = params.get("index")
+        if idx is None:
+            return {"error": "index required"}
+        i = int(idx)
+        if i < 0 or i >= len(target.control):
+            return {"error": f"Control index {i} out of range"}
+        control = target.control[i]
+
+        mode_name = params.get("mode")
+        if mode_name is not None:
+            try:
+                control.mode = ControlMode[mode_name]
+            except KeyError:
+                valid = ", ".join(m.name for m in ControlMode)
+                return {"error": f"Unknown control mode '{mode_name}'. Valid: {valid}"}
+
+        strength = params.get("strength")
+        if strength is not None:
+            s = float(strength)
+            control.use_custom_strength = True
+            control.strength = int(max(0.0, min(2.0, s)) * control.strength_multiplier)
+
+        return {
+            "status": "ok",
+            "scope": label,
+            "control": self._control_info(control, i),
+        }
 
 
 # Register the extension
