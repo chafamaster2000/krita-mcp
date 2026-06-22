@@ -220,6 +220,24 @@ extended `timeout` to `send_command(...)` on both sides.
 | Plugin HTTP port | `5678` | Edit `SERVER_PORT` in plugin `__init__.py` |
 | MCP server URL | `http://localhost:5678` | Set `KRITA_URL` env var |
 | Canvas output dir | `~/krita-mcp-output` | Edit `CANVAS_OUTPUT_DIR` in plugin `__init__.py` |
+| Shared auth token | _(none)_ | Set `KRITAMCP_TOKEN` to the **same** value for both the plugin (env at Krita launch) and the MCP server |
+
+### Security model
+
+The plugin's HTTP server binds to `localhost` only, so remote machines can't
+reach it. Two further guards protect against a malicious local web page driving
+Krita (the classic CSRF / DNS-rebinding vector against a localhost server):
+
+- **Origin guard (always on):** any request carrying an `Origin` or `Referer`
+  header is rejected with `403`. A real MCP client speaks plain HTTP and sends
+  neither; a browser always sends one.
+- **Shared token (optional):** set `KRITAMCP_TOKEN` to require an
+  `X-Kritamcp-Token` header on every request. Set the same value in the
+  environment Krita launches from and for the MCP server process.
+
+File paths passed to `krita_save` / `krita_open_file` are **not** sandboxed —
+your MCP client is trusted to choose them, the same as any agent with disk
+access.
 
 Generated previews from `krita_ai_save_preview` and exports from
 `krita_get_canvas` land in `CANVAS_OUTPUT_DIR`.

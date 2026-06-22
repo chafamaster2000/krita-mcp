@@ -1,2 +1,2 @@
-fastmcp>=2.0
-httpx
+fastmcp>=3.4,<4
+httpx>=0.28,<0.29

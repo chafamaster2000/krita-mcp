@@ -11,7 +11,7 @@ from PyQt5.QtCore import (
 from PyQt5.QtGui import (
     QColor, QImage, QPainter, QPen, QBrush, QPainterPath,
 )
-from PyQt5.QtWidgets import QMessageBox
+from PyQt5.QtWidgets import QMessageBox, QApplication
 import base64
 import json
 import threading
@@ -22,6 +22,10 @@ import os
 # Configuration - customize these as needed
 SERVER_PORT = 5678
 CANVAS_OUTPUT_DIR = os.path.expanduser("~/krita-mcp-output")
+# Optional shared-token auth: if set (same value as the MCP server's
+# KRITAMCP_TOKEN), every request must carry it in the X-Kritamcp-Token header.
+# Empty = no token check (still safe for local use thanks to the Origin guard).
+AUTH_TOKEN = os.environ.get("KRITAMCP_TOKEN", "")
 
 class CommandQueue:
     """Thread-safe command queue for passing commands from HTTP thread to main thread.
@@ -52,27 +56,32 @@ class CommandQueue:
 
     def set_result(self, command_id, result):
         with self.lock:
-            self.results[command_id] = result
             ev = self.events.get(command_id)
-        if ev is not None:
-            ev.set()
+            if ev is None:
+                # The waiter already timed out and cleaned up — drop the result
+                # instead of leaving an orphan in self.results forever.
+                return
+            self.results[command_id] = result
+        ev.set()
 
     def get_result(self, command_id, ev, timeout=120):
         """Block on this command's Event until the main thread sets its result.
 
-        The default timeout of 120s is important — canvas export and save
-        operations can take a long time on large canvases. The MCP server's
-        send_command() timeout must match or exceed this value.
+        The default timeout of 120s matters — canvas export and save operations
+        can take a long time on large canvases. Removing the event under the lock
+        before set_result can store its result is what lets set_result discard
+        orphans (see above), so the two halves never leak entries.
         """
         signalled = ev.wait(timeout)
         with self.lock:
             self.events.pop(command_id, None)
             result = self.results.pop(command_id, None)
+        if result is not None:
+            # Result landed (possibly right at the deadline) — prefer it.
+            return result
         if not signalled:
             return {"error": "Timeout waiting for command execution"}
-        if result is None:
-            return {"error": "Command produced no result"}
-        return result
+        return {"error": "Command produced no result"}
 
 # Global command queue
 command_queue = CommandQueue()
@@ -103,8 +112,23 @@ class PaintRequestHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(json.dumps(data).encode())
 
+    def _auth_ok(self):
+        """Gate every request. A genuine MCP client speaks straight HTTP with no
+        Origin/Referer; a web page (the CSRF / DNS-rebinding vector against a
+        localhost server) always sends one — so reject those outright. An
+        optional shared token adds a second factor when configured."""
+        if self.headers.get('Origin') or self.headers.get('Referer'):
+            self.send_json_response({"error": "Forbidden: browser-origin request rejected"}, 403)
+            return False
+        if AUTH_TOKEN and self.headers.get('X-Kritamcp-Token') != AUTH_TOKEN:
+            self.send_json_response({"error": "Unauthorized"}, 401)
+            return False
+        return True
+
     def do_GET(self):
         """Handle GET requests - mainly for health check."""
+        if not self._auth_ok():
+            return
         parsed = urlparse(self.path)
 
         if parsed.path == '/health':
@@ -126,6 +150,9 @@ class PaintRequestHandler(BaseHTTPRequestHandler):
         """Handle POST requests - paint commands."""
         global command_counter
 
+        if not self._auth_ok():
+            return
+
         content_length = int(self.headers.get('Content-Length', 0))
         body = self.rfile.read(content_length).decode('utf-8')
 
@@ -145,8 +172,16 @@ class PaintRequestHandler(BaseHTTPRequestHandler):
         if dispatcher is not None:
             dispatcher.pushed.emit()
 
+        # Wait just under the client's own timeout so we return a clean timeout
+        # error before its socket gives up. Falls back to 120s if unspecified.
+        try:
+            client_timeout = float(command.get("timeout", 120))
+        except (TypeError, ValueError):
+            client_timeout = 120.0
+        wait_timeout = max(5.0, client_timeout - 2.0)
+
         # Block on this command's own event until the main thread sets a result.
-        result = command_queue.get_result(command_id, ev)
+        result = command_queue.get_result(command_id, ev, timeout=wait_timeout)
 
         if "error" in result:
             self.send_json_response(result, 500)
@@ -161,14 +196,28 @@ class ServerThread(QThread):
         super().__init__()
         self.port = port
         self.server = None
+        self.error = None  # set if bind/serve fails, surfaced by the extension
 
     def run(self):
-        self.server = HTTPServer(('localhost', self.port), PaintRequestHandler)
-        self.server.serve_forever()
+        try:
+            self.server = HTTPServer(('localhost', self.port), PaintRequestHandler)
+        except OSError as e:
+            # Most commonly: port already in use (a stale instance, or a reload
+            # before the old server released the socket). Surface it instead of
+            # dying silently — the extension polls .error after startup.
+            self.error = e
+            print(f"[KritaMCP] Could not bind port {self.port}: {e}")
+            return
+        try:
+            self.server.serve_forever()
+        except Exception as e:
+            self.error = e
+            print(f"[KritaMCP] HTTP server stopped unexpectedly: {e}")
 
     def stop(self):
         if self.server:
             self.server.shutdown()
+            self.server.server_close()
 
 
 class KritaMCPExtension(Extension):
@@ -196,6 +245,13 @@ class KritaMCPExtension(Extension):
             self.server_thread = ServerThread(SERVER_PORT)
             self.server_thread.start()
             print(f"[KritaMCP] HTTP server started on port {SERVER_PORT}")
+            # Shut the server down cleanly when Krita quits so the socket is
+            # released (otherwise the next launch can hit "address in use").
+            app = QApplication.instance()
+            if app is not None:
+                app.aboutToQuit.connect(self.server_thread.stop)
+            # run() binds asynchronously; check shortly after for a bind failure.
+            QTimer.singleShot(750, self._check_server_started)
 
         # Dispatcher: HTTP worker emits `pushed`, Qt delivers it as a queued
         # slot call on this (main) thread → commands run the instant they land.
@@ -210,6 +266,19 @@ class KritaMCPExtension(Extension):
             self.timer = QTimer()
             self.timer.timeout.connect(self.process_commands)
             self.timer.start(250)
+
+    def _check_server_started(self):
+        """Surface a startup bind failure with a visible warning (main thread)."""
+        if self.server_thread is not None and self.server_thread.error is not None:
+            msg = (f"Krita MCP Bridge could not start its server on port "
+                   f"{SERVER_PORT}:\n{self.server_thread.error}\n\n"
+                   f"Another instance or app may be using the port. "
+                   f"MCP tools will not work until this is resolved.")
+            print(f"[KritaMCP] {msg}")
+            try:
+                QMessageBox.warning(None, "Krita MCP Bridge", msg)
+            except Exception:
+                pass
 
     def process_commands(self):
         """Drain and execute every queued command on the main thread."""
@@ -228,81 +297,20 @@ class KritaMCPExtension(Extension):
             doc.refreshProjection()
 
     def execute_command(self, command):
-        """Execute a paint command and return result."""
+        """Execute a paint command and return result.
+
+        Dispatch by convention: action "foo" maps to method cmd_foo. The cmd_
+        prefix is the allow-list — an action can only ever reach a method that
+        was written as a command handler, never arbitrary internals.
+        """
         try:
             action = command.get("action")
             params = command.get("params", {})
 
-            if action == "new_canvas":
-                return self.cmd_new_canvas(params)
-            elif action == "set_color":
-                return self.cmd_set_color(params)
-            elif action == "set_brush":
-                return self.cmd_set_brush(params)
-            elif action == "stroke":
-                return self.cmd_stroke(params)
-            elif action == "fill":
-                return self.cmd_fill(params)
-            elif action == "draw_shape":
-                return self.cmd_draw_shape(params)
-            elif action == "get_canvas":
-                return self.cmd_get_canvas(params)
-            elif action == "undo":
-                return self.cmd_undo(params)
-            elif action == "redo":
-                return self.cmd_redo(params)
-            elif action == "clear":
-                return self.cmd_clear(params)
-            elif action == "save":
-                return self.cmd_save(params)
-            elif action == "get_color_at":
-                return self.cmd_get_color_at(params)
-            elif action == "list_brushes":
-                return self.cmd_list_brushes(params)
-            elif action == "open_file":
-                return self.cmd_open_file(params)
-            elif action == "batch":
-                return self.cmd_batch(params)
-            elif action == "ai_overview":
-                return self.cmd_ai_overview(params)
-            elif action == "ai_status":
-                return self.cmd_ai_status(params)
-            elif action == "ai_set_prompt":
-                return self.cmd_ai_set_prompt(params)
-            elif action == "ai_set_params":
-                return self.cmd_ai_set_params(params)
-            elif action == "ai_set_workspace":
-                return self.cmd_ai_set_workspace(params)
-            elif action == "ai_generate":
-                return self.cmd_ai_generate(params)
-            elif action == "ai_list_jobs":
-                return self.cmd_ai_list_jobs(params)
-            elif action == "ai_apply":
-                return self.cmd_ai_apply(params)
-            elif action == "ai_cancel":
-                return self.cmd_ai_cancel(params)
-            elif action == "ai_save_preview":
-                return self.cmd_ai_save_preview(params)
-            elif action == "ai_list_styles":
-                return self.cmd_ai_list_styles(params)
-            elif action == "ai_create_region":
-                return self.cmd_ai_create_region(params)
-            elif action == "ai_list_regions":
-                return self.cmd_ai_list_regions(params)
-            elif action == "ai_select_region":
-                return self.cmd_ai_select_region(params)
-            elif action == "ai_remove_region":
-                return self.cmd_ai_remove_region(params)
-            elif action == "ai_add_control":
-                return self.cmd_ai_add_control(params)
-            elif action == "ai_list_controls":
-                return self.cmd_ai_list_controls(params)
-            elif action == "ai_remove_control":
-                return self.cmd_ai_remove_control(params)
-            elif action == "ai_set_control":
-                return self.cmd_ai_set_control(params)
-            else:
+            handler = getattr(self, f"cmd_{action}", None) if action else None
+            if handler is None or not callable(handler):
                 return {"error": f"Unknown action: {action}"}
+            return handler(params)
 
         except Exception as e:
             return {"error": str(e)}
@@ -348,13 +356,10 @@ class KritaMCPExtension(Extension):
         layer = doc.createNode("paint", "paintlayer")
         root.addChildNode(layer, None)
 
-        # Fill background using pixel data
+        # Fill background with one C++-side QImage fill (no giant Python list).
         color = QColor(bg_color)
-        r, g, b = color.red(), color.green(), color.blue()
-
-        # Create pixel data for entire canvas (BGRA format)
-        pixel_data = bytes([b, g, r, 255] * (width * height))
-        layer.setPixelData(pixel_data, 0, 0, width, height)
+        color.setAlpha(255)
+        self._solid_fill_layer(layer, width, height, color)
 
         doc.refreshProjection()
 
@@ -456,6 +461,17 @@ class KritaMCPExtension(Extension):
         out = base.constBits().asstring(w * h * 4)
         layer.setPixelData(out, x, y, w, h)
         return True
+
+    def _solid_fill_layer(self, layer, w, h, qcolor):
+        """Fill an entire layer with a solid colour via one C++ QImage.fill.
+
+        Avoids building a `bytes([b,g,r,a] * w*h)` Python list, whose transient
+        pointer array is ~512 MB for a 4K canvas. QImage.fill writes ARGB32,
+        which is BGRA in memory on little-endian — exactly Krita's U8 RGBA order.
+        """
+        img = QImage(w, h, QImage.Format_ARGB32)
+        img.fill(qcolor)
+        layer.setPixelData(img.constBits().asstring(w * h * 4), 0, 0, w, h)
 
     def cmd_stroke(self, params):
         """Paint a stroke through a series of points (QPainter, antialiased)."""
@@ -714,14 +730,11 @@ class KritaMCPExtension(Extension):
         width = doc.width()
         height = doc.height()
 
-        # Clear by filling with background color
+        # Clear by filling with background color (single C++ QImage fill).
         bg_color = params.get("color", "#1a1a2e")
         color = QColor(bg_color)
-        r, g, b = color.red(), color.green(), color.blue()
-
-        # Fill entire layer with color
-        pixel_data = bytes([b, g, r, 255] * (width * height))
-        layer.setPixelData(pixel_data, 0, 0, width, height)
+        color.setAlpha(255)
+        self._solid_fill_layer(layer, width, height, color)
 
         self._maybe_refresh(doc)
 
@@ -758,7 +771,7 @@ class KritaMCPExtension(Extension):
         pixel_data = layer.projectionPixelData(x, y, 1, 1)
 
         if len(pixel_data) >= 4:
-            # RGBA
+            # Krita U8 "RGBA" is laid out BGRA in memory (little-endian ARGB32).
             b, g, r, a = pixel_data[0], pixel_data[1], pixel_data[2], pixel_data[3]
             hex_color = "#{:02x}{:02x}{:02x}".format(r, g, b)
             return {"status": "ok", "color": hex_color, "r": r, "g": g, "b": b, "a": a}
