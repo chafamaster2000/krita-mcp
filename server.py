@@ -123,21 +123,29 @@ def krita_set_brush(
 
 
 @mcp.tool()
-def krita_stroke(points: list[list[int]], pressure: float = 1.0) -> str:
+def krita_stroke(
+    points: list[list[int]],
+    size: Optional[int] = None,
+    feather: float = 0.0,
+    opacity: float = 1.0,
+) -> str:
     """
-    Paint a stroke through a series of points.
+    Paint a stroke through a series of points (antialiased, round cap/join).
 
     Args:
         points: List of [x, y] coordinate pairs, e.g., [[100, 100], [150, 120], [200, 150]]
-        pressure: Brush pressure (0.0 to 1.0, affects stroke thickness/opacity)
+        size: Stroke width in pixels. Omit to use the current brush size.
+        feather: Soft-edge amount (0 = crisp). A few px gives a soft mask boundary.
+        opacity: Stroke opacity 0.0-1.0.
     """
     if len(points) < 2:
         return "Error: Need at least 2 points for a stroke"
 
-    result = send_command("stroke", {
-        "points": points,
-        "pressure": pressure
-    })
+    params = {"points": points, "feather": feather, "opacity": opacity}
+    if size is not None:
+        params["size"] = size
+
+    result = send_command("stroke", params)
 
     if "error" in result:
         return f"Error: {result['error']}"
@@ -145,16 +153,17 @@ def krita_stroke(points: list[list[int]], pressure: float = 1.0) -> str:
 
 
 @mcp.tool()
-def krita_fill(x: int, y: int, radius: int = 50) -> str:
+def krita_fill(x: int, y: int, radius: int = 50, feather: float = 0.0) -> str:
     """
-    Fill an area with current color (paints a filled circle at the point).
+    Fill a circular area with the current color (antialiased).
 
     Args:
         x: X coordinate
         y: Y coordinate
         radius: Fill radius in pixels
+        feather: Soft-edge amount (0 = crisp). Useful for soft region-mask edges.
     """
-    result = send_command("fill", {"x": x, "y": y, "radius": radius})
+    result = send_command("fill", {"x": x, "y": y, "radius": radius, "feather": feather})
 
     if "error" in result:
         return f"Error: {result['error']}"
@@ -170,11 +179,13 @@ def krita_draw_shape(
     height: int = 100,
     fill: bool = True,
     stroke: bool = False,
+    feather: float = 0.0,
     x2: Optional[int] = None,
     y2: Optional[int] = None
 ) -> str:
     """
-    Draw a shape on the canvas.
+    Draw a shape on the canvas (antialiased). Great for region masks: a filled
+    rectangle or ellipse defines WHERE a region applies in one call.
 
     Args:
         shape: Type of shape - "rectangle", "ellipse", or "line"
@@ -184,6 +195,7 @@ def krita_draw_shape(
         height: Height of shape (ignored for lines if x2/y2 provided)
         fill: Whether to fill the shape
         stroke: Whether to draw outline
+        feather: Soft-edge amount (0 = crisp). Useful for soft region-mask edges.
         x2: End X for lines (optional)
         y2: End Y for lines (optional)
     """
@@ -194,7 +206,8 @@ def krita_draw_shape(
         "width": width,
         "height": height,
         "fill": fill,
-        "stroke": stroke
+        "stroke": stroke,
+        "feather": feather
     }
     if x2 is not None:
         params["x2"] = x2

@@ -7,7 +7,9 @@ from krita import *
 from PyQt5.QtCore import (
     QTimer, QThread, pyqtSignal, QObject, Qt, QPointF, QRectF, QUuid,
 )
-from PyQt5.QtGui import QColor
+from PyQt5.QtGui import (
+    QColor, QImage, QPainter, QPen, QBrush, QPainterPath,
+)
 from PyQt5.QtWidgets import QMessageBox
 import json
 import threading
@@ -399,12 +401,62 @@ class KritaMCPExtension(Extension):
 
         return {"status": "ok", "preset": preset_name, "size": size, "opacity": opacity}
 
+    def _fg_qcolor(self, view):
+        """Current foreground colour as a QColor."""
+        fg = view.foregroundColor()
+        return fg.colorForCanvas(view.canvas())
+
+    def _composite(self, layer, doc, bbox, draw_fn, feather=0):
+        """Composite a QPainter drawing onto a layer region in one setPixelData.
+
+        Reads the existing region into a QImage, runs `draw_fn(painter)` to draw
+        (in layer-region-local coordinates) on a transparent overlay, optionally
+        feathers the overlay's alpha, then source-over composites it back. All
+        the heavy lifting happens in Qt's C++ painter — no per-pixel Python.
+
+        bbox is (x, y, w, h) already clamped to the canvas. Krita's U8 RGBA pixel
+        order is BGRA in memory, which is exactly QImage.Format_ARGB32 on
+        little-endian, so the byte buffers map without conversion.
+        """
+        x, y, w, h = bbox
+        if w <= 0 or h <= 0:
+            return False
+
+        existing = bytes(layer.pixelData(x, y, w, h))
+        base = QImage(existing, w, h, QImage.Format_ARGB32).copy()
+
+        overlay = QImage(w, h, QImage.Format_ARGB32)
+        overlay.fill(0)  # fully transparent
+        painter = QPainter(overlay)
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        draw_fn(painter)
+        painter.end()
+
+        if feather and feather > 0:
+            # Cheap, dependency-free blur: downscale then upscale with bilinear
+            # smoothing softens the alpha edge. Scaling is C++ fast.
+            f = max(1, int(feather))
+            sw = max(1, w // (f + 1))
+            sh = max(1, h // (f + 1))
+            overlay = (overlay
+                       .scaled(sw, sh, Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
+                       .scaled(w, h, Qt.IgnoreAspectRatio, Qt.SmoothTransformation))
+
+        comp = QPainter(base)
+        comp.setCompositionMode(QPainter.CompositionMode_SourceOver)
+        comp.drawImage(0, 0, overlay)
+        comp.end()
+
+        out = base.constBits().asstring(w * h * 4)
+        layer.setPixelData(out, x, y, w, h)
+        return True
+
     def cmd_stroke(self, params):
-        """Paint a stroke along points using pixel-level drawing with soft edges."""
+        """Paint a stroke through a series of points (QPainter, antialiased)."""
         points = params.get("points", [])
-        brush_size = params.get("size", self.current_brush_size)
-        hardness = params.get("hardness", 0.5)  # 0.0 = very soft, 1.0 = hard edge
-        opacity = params.get("opacity", 1.0)
+        brush_size = int(params.get("size", self.current_brush_size))
+        feather = float(params.get("feather", 0))
+        opacity = float(params.get("opacity", 1.0))
 
         if len(points) < 2:
             return {"error": "Need at least 2 points for a stroke"}
@@ -415,112 +467,49 @@ class KritaMCPExtension(Extension):
 
         doc = self.get_active_document()
         view = self.get_active_view()
-
         if not view:
             return {"error": "No active view"}
 
-        # Get current foreground color
-        fg = view.foregroundColor()
-        qcolor = fg.colorForCanvas(view.canvas())
-        r, g, b = qcolor.red(), qcolor.green(), qcolor.blue()
-
-        width = doc.width()
-        height = doc.height()
+        qcolor = self._fg_qcolor(view)
         radius = max(1, brush_size // 2)
+        pad = radius + 2
 
-        # Calculate bounding box for all points plus brush radius
-        min_x = max(0, int(min(p[0] for p in points)) - radius - 2)
-        min_y = max(0, int(min(p[1] for p in points)) - radius - 2)
-        max_x = min(width, int(max(p[0] for p in points)) + radius + 2)
-        max_y = min(height, int(max(p[1] for p in points)) + radius + 2)
-
+        min_x = max(0, int(min(p[0] for p in points)) - pad)
+        min_y = max(0, int(min(p[1] for p in points)) - pad)
+        max_x = min(doc.width(), int(max(p[0] for p in points)) + pad)
+        max_y = min(doc.height(), int(max(p[1] for p in points)) + pad)
         w = max_x - min_x
         h = max_y - min_y
 
         if w <= 0 or h <= 0:
             return {"error": "Stroke out of bounds"}
 
-        # Get existing pixel data for the affected region
-        existing = layer.pixelData(min_x, min_y, w, h)
-        pixels = bytearray(existing)
+        path = QPainterPath()
+        path.moveTo(points[0][0] - min_x, points[0][1] - min_y)
+        for p in points[1:]:
+            path.lineTo(p[0] - min_x, p[1] - min_y)
 
-        import math
+        pen_color = QColor(qcolor)
+        pen_color.setAlphaF(max(0.0, min(1.0, opacity)))
 
-        def draw_soft_circle(cx, cy, point_opacity=1.0):
-            """Draw a soft circle with falloff at canvas coordinates."""
-            for dy in range(-radius, radius + 1):
-                for dx in range(-radius, radius + 1):
-                    dist_sq = dx*dx + dy*dy
-                    if dist_sq <= radius*radius:
-                        px = int(cx) + dx - min_x
-                        py = int(cy) + dy - min_y
-                        if 0 <= px < w and 0 <= py < h:
-                            # Calculate distance from center (0.0 to 1.0)
-                            dist = math.sqrt(dist_sq) / radius if radius > 0 else 0
+        def draw(painter):
+            pen = QPen(pen_color, brush_size)
+            pen.setCapStyle(Qt.RoundCap)
+            pen.setJoinStyle(Qt.RoundJoin)
+            painter.setPen(pen)
+            painter.drawPath(path)
 
-                            # Apply hardness curve
-                            # hardness=1.0: sharp edge, hardness=0.0: gradual fade from center
-                            if hardness >= 1.0:
-                                alpha_factor = 1.0
-                            else:
-                                # Soft falloff: starts fading at hardness point
-                                if dist < hardness:
-                                    alpha_factor = 1.0
-                                else:
-                                    # Smooth falloff from hardness to edge
-                                    falloff = (dist - hardness) / (1.0 - hardness) if hardness < 1.0 else 0
-                                    alpha_factor = 1.0 - falloff
+        self._composite(layer, doc, (min_x, min_y, w, h), draw, feather=feather)
+        self._maybe_refresh(doc)
 
-                            final_alpha = int(255 * alpha_factor * opacity * point_opacity)
-
-                            if final_alpha > 0:
-                                idx = (py * w + px) * 4
-                                # Alpha blending with existing pixel
-                                existing_b = pixels[idx]
-                                existing_g = pixels[idx+1]
-                                existing_r = pixels[idx+2]
-                                existing_a = pixels[idx+3]
-
-                                # Simple alpha blend
-                                blend = final_alpha / 255.0
-                                new_r = int(existing_r * (1 - blend) + r * blend)
-                                new_g = int(existing_g * (1 - blend) + g * blend)
-                                new_b = int(existing_b * (1 - blend) + b * blend)
-                                new_a = max(existing_a, final_alpha)
-
-                                pixels[idx] = new_b
-                                pixels[idx+1] = new_g
-                                pixels[idx+2] = new_r
-                                pixels[idx+3] = new_a
-
-        def draw_line(x1, y1, x2, y2):
-            """Draw a line using interpolation with soft brush circles."""
-            dist = math.sqrt((x2 - x1)**2 + (y2 - y1)**2)
-            # More steps for smoother lines
-            steps = max(1, int(dist / max(1, radius / 3)))
-
-            for i in range(steps + 1):
-                t = i / steps if steps > 0 else 0
-                x = x1 + t * (x2 - x1)
-                y = y1 + t * (y2 - y1)
-                draw_soft_circle(x, y)
-
-        # Draw soft circles at each point and lines between them
-        for i in range(len(points)):
-            draw_soft_circle(points[i][0], points[i][1])
-            if i > 0:
-                draw_line(points[i-1][0], points[i-1][1], points[i][0], points[i][1])
-
-        layer.setPixelData(bytes(pixels), min_x, min_y, w, h)
-        doc.refreshProjection()
-
-        return {"status": "ok", "points_count": len(points), "hardness": hardness}
+        return {"status": "ok", "points_count": len(points), "feather": feather}
 
     def cmd_fill(self, params):
-        """Fill a circular area with current color."""
-        x = params.get("x", 0)
-        y = params.get("y", 0)
-        radius = params.get("radius", 50)
+        """Fill a circular area with the current color (QPainter, antialiased)."""
+        x = int(params.get("x", 0))
+        y = int(params.get("y", 0))
+        radius = int(params.get("radius", 50))
+        feather = float(params.get("feather", 0))
 
         layer = self.get_active_layer()
         if not layer:
@@ -528,57 +517,43 @@ class KritaMCPExtension(Extension):
 
         doc = self.get_active_document()
         view = self.get_active_view()
-
         if not view:
             return {"error": "No active view"}
 
-        # Get current foreground color
-        fg = view.foregroundColor()
-        qcolor = fg.colorForCanvas(view.canvas())
-        r, g, b = qcolor.red(), qcolor.green(), qcolor.blue()
+        qcolor = QColor(self._fg_qcolor(view))
+        qcolor.setAlpha(255)
 
-        # Paint a filled circle using pixel data
-        # Create a bounding box
-        x1 = max(0, x - radius)
-        y1 = max(0, y - radius)
-        x2 = min(doc.width(), x + radius)
-        y2 = min(doc.height(), y + radius)
+        pad = 2
+        x1 = max(0, x - radius - pad)
+        y1 = max(0, y - radius - pad)
+        x2 = min(doc.width(), x + radius + pad)
+        y2 = min(doc.height(), y + radius + pad)
         w = x2 - x1
         h = y2 - y1
 
         if w <= 0 or h <= 0:
             return {"error": "Fill area out of bounds"}
 
-        # Get existing pixel data
-        existing = layer.pixelData(x1, y1, w, h)
-        pixels = bytearray(existing)
+        def draw(painter):
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(QBrush(qcolor))
+            painter.drawEllipse(QPointF(x - x1, y - y1), radius, radius)
 
-        # Draw circle
-        for py in range(h):
-            for px in range(w):
-                # Check if point is in circle
-                dx = (x1 + px) - x
-                dy = (y1 + py) - y
-                if dx*dx + dy*dy <= radius*radius:
-                    idx = (py * w + px) * 4
-                    pixels[idx] = b      # B
-                    pixels[idx+1] = g    # G
-                    pixels[idx+2] = r    # R
-                    pixels[idx+3] = 255  # A
+        self._composite(layer, doc, (x1, y1, w, h), draw, feather=feather)
+        self._maybe_refresh(doc)
 
-        layer.setPixelData(bytes(pixels), x1, y1, w, h)
-        doc.refreshProjection()
-
-        return {"status": "ok", "x": x, "y": y, "radius": radius}
+        return {"status": "ok", "x": x, "y": y, "radius": radius, "feather": feather}
 
     def cmd_draw_shape(self, params):
-        """Draw a shape (rectangle, ellipse, line)."""
+        """Draw a shape (rectangle, ellipse, line) with QPainter (antialiased)."""
         shape = params.get("shape", "rectangle")
-        x = params.get("x", 0)
-        y = params.get("y", 0)
-        width = params.get("width", 100)
-        height = params.get("height", 100)
-        fill = params.get("fill", True)
+        x = float(params.get("x", 0))
+        y = float(params.get("y", 0))
+        width = float(params.get("width", 100))
+        height = float(params.get("height", 100))
+        fill = bool(params.get("fill", True))
+        stroke = bool(params.get("stroke", False))
+        feather = float(params.get("feather", 0))
 
         layer = self.get_active_layer()
         if not layer:
@@ -586,104 +561,68 @@ class KritaMCPExtension(Extension):
 
         doc = self.get_active_document()
         view = self.get_active_view()
-
         if not view:
             return {"error": "No active view"}
 
-        # Get current foreground color
-        fg = view.foregroundColor()
-        qcolor = fg.colorForCanvas(view.canvas())
-        r, g, b = qcolor.red(), qcolor.green(), qcolor.blue()
+        qcolor = QColor(self._fg_qcolor(view))
+        qcolor.setAlpha(255)
 
         if shape == "line":
-            # Draw line using pixel data
-            x2 = params.get("x2", x + width)
-            y2 = params.get("y2", y + height)
-            line_width = params.get("line_width", 2)
+            x2 = float(params.get("x2", x + width))
+            y2 = float(params.get("y2", y + height))
+            line_width = int(params.get("line_width", 2))
+            pad = line_width + 2
 
-            # Calculate bounding box
-            x1_bound = max(0, int(min(x, x2)) - line_width)
-            y1_bound = max(0, int(min(y, y2)) - line_width)
-            x2_bound = min(doc.width(), int(max(x, x2)) + line_width)
-            y2_bound = min(doc.height(), int(max(y, y2)) + line_width)
-            w = x2_bound - x1_bound
-            h = y2_bound - y1_bound
+            x1b = max(0, int(min(x, x2)) - pad)
+            y1b = max(0, int(min(y, y2)) - pad)
+            x2b = min(doc.width(), int(max(x, x2)) + pad)
+            y2b = min(doc.height(), int(max(y, y2)) + pad)
+            w = x2b - x1b
+            h = y2b - y1b
+            if w <= 0 or h <= 0:
+                return {"error": "Line out of bounds"}
 
-            if w > 0 and h > 0:
-                existing = layer.pixelData(x1_bound, y1_bound, w, h)
-                pixels = bytearray(existing)
+            def draw(painter):
+                pen = QPen(qcolor, line_width)
+                pen.setCapStyle(Qt.RoundCap)
+                painter.setPen(pen)
+                painter.drawLine(QPointF(x - x1b, y - y1b), QPointF(x2 - x1b, y2 - y1b))
 
-                # Draw line with thickness
-                dist = max(abs(x2 - x), abs(y2 - y))
-                steps = max(1, int(dist))
-                radius = max(1, line_width // 2)
+            self._composite(layer, doc, (x1b, y1b, w, h), draw, feather=feather)
 
-                for i in range(steps + 1):
-                    t = i / steps if steps > 0 else 0
-                    cx = x + t * (x2 - x)
-                    cy = y + t * (y2 - y)
-                    for dy in range(-radius, radius + 1):
-                        for dx in range(-radius, radius + 1):
-                            if dx*dx + dy*dy <= radius*radius:
-                                px = int(cx) + dx - x1_bound
-                                py = int(cy) + dy - y1_bound
-                                if 0 <= px < w and 0 <= py < h:
-                                    idx = (py * w + px) * 4
-                                    pixels[idx] = b
-                                    pixels[idx+1] = g
-                                    pixels[idx+2] = r
-                                    pixels[idx+3] = 255
-
-                layer.setPixelData(bytes(pixels), x1_bound, y1_bound, w, h)
-        elif shape == "rectangle" and fill:
-            # Draw filled rectangle using pixel data
-            x1 = max(0, int(x))
-            y1 = max(0, int(y))
-            x2 = min(doc.width(), int(x + width))
-            y2 = min(doc.height(), int(y + height))
+        elif shape in ("rectangle", "ellipse"):
+            pad = 2
+            x1 = max(0, int(x) - pad)
+            y1 = max(0, int(y) - pad)
+            x2 = min(doc.width(), int(x + width) + pad)
+            y2 = min(doc.height(), int(y + height) + pad)
             w = x2 - x1
             h = y2 - y1
+            if w <= 0 or h <= 0:
+                return {"error": "Shape out of bounds"}
 
-            if w > 0 and h > 0:
-                pixel_data = bytes([b, g, r, 255] * (w * h))
-                layer.setPixelData(pixel_data, x1, y1, w, h)
-        elif shape == "ellipse" and fill:
-            # Draw filled ellipse using pixel data
-            cx = x + width / 2
-            cy = y + height / 2
-            rx = width / 2
-            ry = height / 2
+            rect = QRectF(x - x1, y - y1, width, height)
 
-            x1 = max(0, int(x))
-            y1 = max(0, int(y))
-            x2 = min(doc.width(), int(x + width))
-            y2 = min(doc.height(), int(y + height))
-            w = x2 - x1
-            h = y2 - y1
+            def draw(painter):
+                if fill:
+                    painter.setBrush(QBrush(qcolor))
+                else:
+                    painter.setBrush(Qt.NoBrush)
+                if stroke or not fill:
+                    painter.setPen(QPen(qcolor, int(params.get("line_width", 2))))
+                else:
+                    painter.setPen(Qt.NoPen)
+                if shape == "rectangle":
+                    painter.drawRect(rect)
+                else:
+                    painter.drawEllipse(rect)
 
-            if w > 0 and h > 0:
-                existing = layer.pixelData(x1, y1, w, h)
-                pixels = bytearray(existing)
-
-                for py in range(h):
-                    for px in range(w):
-                        # Check if point is in ellipse
-                        dx = (x1 + px - cx) / rx if rx > 0 else 0
-                        dy = (y1 + py - cy) / ry if ry > 0 else 0
-                        if dx*dx + dy*dy <= 1:
-                            idx = (py * w + px) * 4
-                            pixels[idx] = b
-                            pixels[idx+1] = g
-                            pixels[idx+2] = r
-                            pixels[idx+3] = 255
-
-                layer.setPixelData(bytes(pixels), x1, y1, w, h)
+            self._composite(layer, doc, (x1, y1, w, h), draw, feather=feather)
         else:
-            return {"error": f"Shape '{shape}' with current options not supported"}
+            return {"error": f"Unknown shape '{shape}'"}
 
-        doc.refreshProjection()
-
-        return {"status": "ok", "shape": shape}
+        self._maybe_refresh(doc)
+        return {"status": "ok", "shape": shape, "feather": feather}
 
     def cmd_get_canvas(self, params):
         """Export current canvas to file and return path."""
@@ -745,7 +684,7 @@ class KritaMCPExtension(Extension):
         pixel_data = bytes([b, g, r, 255] * (width * height))
         layer.setPixelData(pixel_data, 0, 0, width, height)
 
-        doc.refreshProjection()
+        self._maybe_refresh(doc)
 
         return {"status": "ok", "color": bg_color}
 
