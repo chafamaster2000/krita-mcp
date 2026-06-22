@@ -6,11 +6,13 @@ Allows Claude (or any MCP client) to paint by sending commands to this plugin.
 from krita import *
 from PyQt5.QtCore import (
     QTimer, QThread, pyqtSignal, QObject, Qt, QPointF, QRectF, QUuid,
+    QByteArray, QBuffer, QIODevice,
 )
 from PyQt5.QtGui import (
     QColor, QImage, QPainter, QPen, QBrush, QPainterPath,
 )
 from PyQt5.QtWidgets import QMessageBox
+import base64
 import json
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -625,25 +627,58 @@ class KritaMCPExtension(Extension):
         return {"status": "ok", "shape": shape, "feather": feather}
 
     def cmd_get_canvas(self, params):
-        """Export current canvas to file and return path."""
-        filename = params.get("filename", "canvas.png")
+        """Grab the current canvas as an inline image (base64) for review.
 
+        mode="fast" (default): downscaled JPEG (<= max_dim px) — cheap to encode
+        and few vision tokens. Use this while drawing/iterating.
+        mode="full": full-resolution PNG — use to inspect the final result.
+
+        Returns the image bytes base64-encoded; the MCP server wraps them as an
+        inline Image so the client sees the canvas directly (no disk round-trip).
+        """
+        mode = params.get("mode", "fast")
         doc = self.get_active_document()
         if not doc:
             return {"error": "No active document"}
 
-        # Ensure filename has extension
-        if not filename.endswith('.png'):
-            filename += '.png'
+        w, h = doc.width(), doc.height()
 
-        filepath = os.path.join(CANVAS_OUTPUT_DIR, filename)
+        if mode == "full":
+            img = doc.projection(0, 0, w, h)
+            fmt, mime, quality = "PNG", "image/png", -1
+        else:
+            max_dim = int(params.get("max_dim", 1024))
+            if w >= h:
+                tw = min(w, max_dim)
+                th = max(1, round(h * tw / w))
+            else:
+                th = min(h, max_dim)
+                tw = max(1, round(w * th / h))
+            img = doc.thumbnail(tw, th)
+            fmt, mime, quality = "JPEG", "image/jpeg", 85
 
-        # Export image (batch mode suppresses export dialog)
-        doc.setBatchmode(True)
-        doc.exportImage(filepath, InfoObject())
-        doc.setBatchmode(False)
+        if img is None or img.isNull():
+            return {"error": "Could not render canvas projection"}
 
-        return {"status": "ok", "path": filepath}
+        ba = QByteArray()
+        buf = QBuffer(ba)
+        buf.open(QIODevice.WriteOnly)
+        if quality >= 0:
+            img.save(buf, fmt, quality)
+        else:
+            img.save(buf, fmt)
+        buf.close()
+
+        b64 = base64.b64encode(bytes(ba)).decode("ascii")
+        return {
+            "status": "ok",
+            "mode": mode,
+            "mime": mime,
+            "format": fmt.lower(),
+            "data_b64": b64,
+            "width": img.width(),
+            "height": img.height(),
+        }
 
     def cmd_undo(self, params):
         """Undo last action."""

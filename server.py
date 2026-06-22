@@ -7,6 +7,11 @@ communicating with a Krita plugin via HTTP.
 """
 
 from fastmcp import FastMCP
+try:
+    from fastmcp.utilities.types import Image
+except ImportError:  # newer FastMCP re-exports it at the top level
+    from fastmcp import Image
+import base64
 import httpx
 import os
 from typing import Optional
@@ -37,6 +42,12 @@ def send_command(action: str, params: dict = None, timeout: float = 30.0) -> dic
         return {"error": "Cannot connect to Krita. Is Krita running with the MCP plugin enabled?"}
     except Exception as e:
         return {"error": str(e)}
+
+
+def _decode_image(result: dict) -> Image:
+    """Turn a plugin canvas payload (base64 + format) into an inline MCP Image."""
+    raw = base64.b64decode(result["data_b64"])
+    return Image(data=raw, format=result.get("format", "png"))
 
 
 @mcp.tool()
@@ -222,22 +233,27 @@ def krita_draw_shape(
 
 
 @mcp.tool()
-def krita_get_canvas(filename: str = "canvas.png") -> str:
+def krita_get_canvas(mode: str = "fast", max_dim: int = 1024) -> Image:
     """
-    Export current canvas to a PNG file and return the path.
-    Use this to see your painting progress.
+    Look at the current canvas. Returns the image inline so you can see it directly.
+
+    Pick the mode by intent:
+      - mode="fast" (DEFAULT): a downscaled JPEG (<= max_dim px). Cheap and quick.
+        Use this WHILE drawing/iterating — checking placement, progress, masks.
+      - mode="full": the full-resolution PNG. Slower / more tokens. Use this ONLY
+        to review the FINAL result once you're done, when detail matters.
 
     Args:
-        filename: Output filename (saved to configured output directory)
+        mode: "fast" for the drawing loop (default), "full" for final review.
+        max_dim: Max longest-side pixels for fast mode (default 1024).
     """
-    # Extended timeout — canvas export can take a while on large canvases
-    result = send_command("get_canvas", {"filename": filename}, timeout=120.0)
+    # Extended timeout — full-res render can take a while on large canvases
+    result = send_command("get_canvas", {"mode": mode, "max_dim": max_dim}, timeout=120.0)
 
     if "error" in result:
-        return f"Error: {result['error']}"
+        raise RuntimeError(result["error"])
 
-    path = result.get("path", "")
-    return f"Canvas saved to: {path}"
+    return _decode_image(result)
 
 
 @mcp.tool()
