@@ -105,6 +105,36 @@ Add to your MCP client config (e.g., Claude Desktop's `claude_desktop_config.jso
 
 If using a virtual environment, point `command` at the venv's Python.
 
+### 5. (Optional) Install the prompt-formatting skills + hook
+
+The repo ships the prompt-formatting workflow as Claude Code skills and a hook in
+`claude/` (the canonical source — same model as the plugin: copy them out to where
+the tool reads them). To activate them, copy into your Claude Code config dir:
+
+| OS | Config dir |
+|----|------------|
+| macOS / Linux | `~/.claude/` |
+| Windows | `%USERPROFILE%\.claude\` |
+
+Copy `claude/skills/*` → `<config>/skills/` and `claude/hooks/krita-prompt-reminder.py`
+→ `<config>/hooks/`. Then add the hook to your `<config>/settings.json` (merge into
+any existing `"hooks"`):
+
+```json
+"PreToolUse": [
+  {
+    "matcher": "mcp__krita__krita_ai_set_prompt|mcp__krita__krita_ai_generate",
+    "hooks": [
+      { "type": "command", "command": "python3 \"$HOME/.claude/hooks/krita-prompt-reminder.py\"", "timeout": 8 }
+    ]
+  }
+]
+```
+
+On Windows use `python` (or `py`) instead of `python3`; `$HOME` resolves in both
+PowerShell and Git Bash. Restart Claude Code (or open `/hooks`) to load it. The
+hook is reminder-only and never blocks.
+
 ## Available Tools
 
 ### Original Painting Tools (from upstream)
@@ -203,6 +233,50 @@ The canonical loop for region-based generation:
   source. Useful for style-transferring an existing image (set
   `style="digital-artwork-xl"`, `strength=0.6`, set a new prompt, generate).
 
+## Prompt Formatting — Match the Model Family
+
+**Every diffusion model family wants a different prompt *language*.** Sending
+danbooru tags to a natural-language model (or full sentences to a booru anime
+model) noticeably degrades results. The rule of thumb: **before every
+`krita_ai_set_prompt`, check the active style with `krita_ai_status` and format
+the prompt for that style's family.**
+
+| Family (keyword in style name) | Prompt convention | Negative |
+|---|---|---|
+| Flux, Flux Kontext, Z-Image, Qwen, SD3, SDXL realistic (Cinematic Photo / Digital Artwork) | Natural language — descriptive sentences | Flux / Z-Image Turbo ignore it (leave empty); others optional |
+| Pony, Illustrious, NoobAI, Animagine, most anime SDXL/SD1.5 | Danbooru tags — comma-separated keywords (Pony also needs `score_9, score_8_up, score_7_up`) | Quality tags: `worst quality, low quality, ...` |
+
+Two more rules:
+
+- **Confirm by architecture, not just the name.** A style named "Realistic" can
+  run on an anime checkpoint. `krita_ai_status` returns a `model` block with the
+  resolved `architecture` (e.g. `flux`, `zimage`, `illu`, `qwen`, `sd3`, `sdxl`),
+  `checkpoint`, and `loras` — classify by that. Note `sdxl`/`sd15` are ambiguous
+  (they run both booru and natural-language checkpoints), so for those fall back
+  to the checkpoint/style name; if still unclear, don't guess — ask.
+- **Unknown proper nouns → look them up first.** If a prompt names a character,
+  creature, or fictional place that isn't a globally known real person/landmark
+  (e.g. "Deku Tree", not "Messi"), web-search it before writing the prompt so you
+  describe what it actually looks like instead of inventing something generic.
+
+This workflow is encoded as three editable Claude Code skills (source of truth,
+meant to change as model families do — not hardcoded into the plugin):
+
+| Skill | Role |
+|-------|------|
+| `krita-ai-prompt-format` | Model→convention table, tag↔sentence conversion, per-family negatives. Classifies by `model.architecture`. |
+| `image-prompt-unknown-entities` | Web-search an unknown proper noun before describing it (reusable beyond Krita). |
+| `image-prompt-sanity-check` | Last gate before `krita_ai_generate`: verify the final prompt is coherent with the active model and the user's intent. |
+
+A reminder-only `PreToolUse` hook (`krita-prompt-reminder.py`) fires before
+`krita_ai_set_prompt` / `krita_ai_generate`: it calls `ai_status` itself and
+injects the active model's family + convention, so the right format is enforced
+even if the skills aren't loaded. It never blocks.
+
+The canonical source for all of this lives in `claude/` in this repo; see
+[Setup step 5](#5-optional-install-the-prompt-formatting-skills--hook) to deploy
+it to your Claude Code config dir.
+
 ## The Export Timeout Fix (from upstream)
 
 By default HTTP requests and command queue operations time out after ~30 seconds.
@@ -220,6 +294,24 @@ extended `timeout` to `send_command(...)` on both sides.
 | Plugin HTTP port | `5678` | Edit `SERVER_PORT` in plugin `__init__.py` |
 | MCP server URL | `http://localhost:5678` | Set `KRITA_URL` env var |
 | Canvas output dir | `~/krita-mcp-output` | Edit `CANVAS_OUTPUT_DIR` in plugin `__init__.py` |
+| Shared auth token | _(none)_ | Set `KRITAMCP_TOKEN` to the **same** value for both the plugin (env at Krita launch) and the MCP server |
+
+### Security model
+
+The plugin's HTTP server binds to `localhost` only, so remote machines can't
+reach it. Two further guards protect against a malicious local web page driving
+Krita (the classic CSRF / DNS-rebinding vector against a localhost server):
+
+- **Origin guard (always on):** any request carrying an `Origin` or `Referer`
+  header is rejected with `403`. A real MCP client speaks plain HTTP and sends
+  neither; a browser always sends one.
+- **Shared token (optional):** set `KRITAMCP_TOKEN` to require an
+  `X-Kritamcp-Token` header on every request. Set the same value in the
+  environment Krita launches from and for the MCP server process.
+
+File paths passed to `krita_save` / `krita_open_file` are **not** sandboxed —
+your MCP client is trusted to choose them, the same as any agent with disk
+access.
 
 Generated previews from `krita_ai_save_preview` and exports from
 `krita_get_canvas` land in `CANVAS_OUTPUT_DIR`.
