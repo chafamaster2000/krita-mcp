@@ -448,6 +448,11 @@ def krita_ai_status() -> str:
     """
     Get AI Diffusion plugin status: server connection, active document, workspace,
     current style/strength/seed, queued/executing/finished job counts, current prompt.
+
+    The `model` field reports the active style's resolved architecture for prompt
+    formatting: model.architecture is the family (e.g. "sdxl", "flux", "zimage",
+    "illu", "qwen", "sd3"), plus checkpoint and loras. Use it to format prompts in
+    the right convention (natural language vs danbooru tags) before ai_set_prompt.
     """
     return _fmt(send_command("ai_status"))
 
@@ -459,7 +464,8 @@ def krita_ai_overview() -> str:
     strength, seed, queue) plus all regions, control layers, recent jobs, and
     available styles. Prefer this over chaining ai_status + ai_list_regions +
     ai_list_controls + ai_list_jobs + ai_list_styles when you need the lay of
-    the land before or after making changes.
+    the land before or after making changes. The `ai.model` field carries the
+    resolved architecture (family/checkpoint/loras) for prompt formatting.
     """
     return _fmt(send_command("ai_overview"))
 

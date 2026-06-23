@@ -886,6 +886,52 @@ class KritaMCPExtension(Extension):
             raise RuntimeError("No active document — open a document in Krita first")
         return ai, model
 
+    def _style_model_info(self, root, style):
+        """Best-effort resolution of the active style's architecture/checkpoint so the
+        MCP client can classify the model family (natural-language vs danbooru tags)
+        by hard data instead of guessing from the style filename.
+
+        Degrades gracefully: any failure (AI Diffusion API drift, offline, older
+        version) returns a partial dict with available=False — it must NEVER break
+        ai_status. `architecture` is the Arch enum member name, e.g. "sdxl", "flux",
+        "zimage", "illu", "qwen", "sd3" (or "auto" if undetermined)."""
+        info = {"available": False}
+        if style is None:
+            return info
+        arch = None
+        try:
+            from ai_diffusion.backend.client import resolve_arch
+
+            client = getattr(root.connection, "client_if_connected", None)
+            arch = resolve_arch(style, client)
+            info["resolved_from"] = "checkpoint" if client else "style"
+        except Exception as e:
+            # Fallback: read the declared architecture/version off the style directly
+            # (covers offline + older AI Diffusion layouts that used `sd_version`).
+            arch = getattr(style, "architecture", None) or getattr(style, "sd_version", None)
+            info["resolved_from"] = "declared"
+            if arch is None:
+                info["error"] = f"arch resolve failed: {e}"
+        if arch is not None:
+            info["architecture"] = getattr(arch, "name", str(arch))
+            info["architecture_label"] = getattr(arch, "value", None)
+            info["available"] = True
+        try:
+            cks = getattr(style, "checkpoints", None) or []
+            info["checkpoint"] = cks[0] if cks else None
+        except Exception:
+            pass
+        try:
+            loras = getattr(style, "loras", None) or []
+            info["loras"] = [
+                l.get("name")
+                for l in loras
+                if isinstance(l, dict) and l.get("enabled", True) and l.get("name")
+            ]
+        except Exception:
+            pass
+        return info
+
     def cmd_ai_overview(self, params):
         """Consolidated AI Diffusion state in one round-trip: status + regions +
         controls + recent jobs + styles. Lets the client know exactly where it
@@ -926,6 +972,7 @@ class KritaMCPExtension(Extension):
         status["document"] = model.document.filename or "(unsaved)"
         status["workspace"] = model.workspace.name
         status["style"] = model.style.filename if model.style else None
+        status["model"] = self._style_model_info(root, model.style)
         status["strength"] = float(model.strength)
         status["seed"] = int(model.seed)
         status["fixed_seed"] = bool(model.fixed_seed)
