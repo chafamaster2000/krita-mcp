@@ -166,6 +166,75 @@ class KriTest(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertTrue(os.path.isabs(self.last_request()["params"]["path"]))
 
+    # ----- Task 5 -----
+
+    def _canvas_payload(self, fmt="jpeg"):
+        return {"status": "ok", "mode": "fast", "format": fmt,
+                "data_b64": base64.b64encode(b"fakeimagebytes").decode(),
+                "width": 640, "height": 480}
+
+    def test_look_writes_image_and_prints_path(self):
+        FakePlugin.responses["get_canvas"] = self._canvas_payload()
+        with tempfile.TemporaryDirectory() as d:
+            dest = os.path.join(d, "c.jpg")
+            r = self.kri("look", "-o", dest)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            info = json.loads(r.stdout)
+            self.assertEqual(info["path"], dest)
+            with open(dest, "rb") as f:
+                self.assertEqual(f.read(), b"fakeimagebytes")
+        self.assertEqual(self.last_request()["params"]["mode"], "fast")
+
+    def test_look_full_mode(self):
+        FakePlugin.responses["get_canvas"] = self._canvas_payload(fmt="png")
+        with tempfile.TemporaryDirectory() as d:
+            dest = os.path.join(d, "c.png")
+            r = self.kri("look", "--full", "-o", dest)
+            self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.last_request()["params"]["mode"], "full")
+
+    def test_batch_from_stdin_sets_stop_on_error(self):
+        FakePlugin.responses["batch"] = {"status": "ok", "count": 2,
+                                         "results": [{"status": "ok"}] * 2}
+        script = json.dumps([
+            {"action": "set_color", "params": {"color": "#fff"}},
+            {"action": "fill", "params": {"x": 1, "y": 2, "radius": 3}},
+        ])
+        r = self.kri("batch", stdin=script)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        req = self.last_request()
+        self.assertEqual(req["action"], "batch")
+        self.assertTrue(req["params"]["stop_on_error"])
+        self.assertEqual(len(req["params"]["commands"]), 2)
+
+    def test_batch_stopped_at_exits_1(self):
+        FakePlugin.responses["batch"] = {
+            "status": "ok", "count": 2, "stopped_at": 1,
+            "results": [{"status": "ok"}, {"error": "boom"}],
+        }
+        r = self.kri("batch", stdin='[{"action":"undo"},{"action":"undo"}]')
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("stopped at command 1", r.stderr)
+
+    def test_batch_look_writes_canvas(self):
+        FakePlugin.responses["batch"] = {
+            "status": "ok", "count": 1, "results": [{"status": "ok"}],
+            "canvas": self._canvas_payload(),
+        }
+        with tempfile.TemporaryDirectory() as d:
+            dest = os.path.join(d, "after.jpg")
+            r = self.kri("batch", "--look", "fast", "-o", dest,
+                         stdin='[{"action":"undo"}]')
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertTrue(os.path.exists(dest))
+            res = json.loads(r.stdout)
+            self.assertEqual(res["canvas"]["path"], dest)
+        self.assertEqual(self.last_request()["params"]["review"], "fast")
+
+    def test_batch_invalid_json_exits_2(self):
+        r = self.kri("batch", stdin="not json")
+        self.assertEqual(r.returncode, 2)
+
 
 if __name__ == "__main__":
     unittest.main()

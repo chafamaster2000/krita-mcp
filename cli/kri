@@ -196,6 +196,35 @@ def cmd_brushes(a):
     out(send("list_brushes", {"filter": a.filter, "limit": a.limit}))
 
 
+def cmd_look(a):
+    mode = "full" if a.full else "fast"
+    res = send("get_canvas", clean(mode=mode, max_dim=a.max_dim), timeout=120.0)
+    if not isinstance(res, dict) or res.get("error"):
+        out(res)
+    out(write_image(res, look_path(res, a.out)))
+
+
+def cmd_batch(a):
+    try:
+        commands = json.loads(read_source(a.file))
+    except json.JSONDecodeError as e:
+        print(f"kri: invalid batch JSON: {e}", file=sys.stderr)
+        sys.exit(2)
+    if isinstance(commands, dict):
+        commands = [commands]
+    res = send("batch",
+               clean(commands=commands, review=a.look, stop_on_error=True),
+               timeout=120.0)
+    if not isinstance(res, dict) or res.get("error"):
+        out(res)
+    canvas = res.pop("canvas", None)
+    if a.look and isinstance(canvas, dict) and canvas.get("data_b64"):
+        res["canvas"] = write_image(canvas, look_path(canvas, a.out))
+    if res.get("stopped_at") is not None:
+        res["error"] = f"batch stopped at command {res['stopped_at']}"
+    out(res)
+
+
 def build_parser():
     p = argparse.ArgumentParser(
         prog="kri",
@@ -281,6 +310,21 @@ def build_parser():
     sp.add_argument("filter", nargs="?", default="")
     sp.add_argument("--limit", type=int, default=20)
     sp.set_defaults(fn=cmd_brushes)
+
+    sp = sub.add_parser("look", help="save canvas image to a file, print its path")
+    sp.add_argument("--full", action="store_true",
+                    help="full-res PNG (default: fast downscaled JPEG)")
+    sp.add_argument("--max-dim", type=int, default=1024, dest="max_dim")
+    sp.add_argument("-o", "--out")
+    sp.set_defaults(fn=cmd_look)
+
+    sp = sub.add_parser("batch",
+                        help="run many commands in one round-trip (JSON file or stdin)")
+    sp.add_argument("file", nargs="?", default="-")
+    sp.add_argument("--look", choices=["fast", "full"],
+                    help="also return the final canvas image")
+    sp.add_argument("-o", "--out")
+    sp.set_defaults(fn=cmd_batch)
 
     return p
 
