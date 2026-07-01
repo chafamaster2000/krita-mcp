@@ -120,6 +120,24 @@ def cmd_health(a):
         out({"error": f"Cannot connect to Krita at {KRITA_URL}: {e}"})
 
 
+def cmd_status(a):
+    """Document + full AI overview in ONE round-trip via the plugin's batch."""
+    res = send("batch", {"commands": [{"action": "doc_info"},
+                                      {"action": "ai_overview"}]}, timeout=30.0)
+    if not isinstance(res, dict) or res.get("error"):
+        out(res)
+    results = (res.get("results") or []) + [{}, {}]
+    doc_res, ai_res = results[0] or {}, results[1] or {}
+    merged = {}
+    merged["doc"] = (doc_res.get("document") if not doc_res.get("error")
+                     else {"error": doc_res["error"]})
+    if not ai_res.get("error"):
+        merged.update({k: v for k, v in ai_res.items() if k != "status"})
+    else:
+        merged["ai"] = {"error": ai_res["error"]}
+    out(merged)
+
+
 def cmd_undo(a):
     out(send("undo"))
 
@@ -133,6 +151,9 @@ def build_parser():
 
     sp = sub.add_parser("health", help="check the plugin is up")
     sp.set_defaults(fn=cmd_health)
+
+    sp = sub.add_parser("status", help="document + full AI state in one round-trip")
+    sp.set_defaults(fn=cmd_status)
 
     sp = sub.add_parser("undo", help="undo last action")
     sp.set_defaults(fn=cmd_undo)

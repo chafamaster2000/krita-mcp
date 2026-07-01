@@ -85,6 +85,43 @@ class KriTest(unittest.TestCase):
         self.assertEqual(r.returncode, 1)
         self.assertIn("Cannot connect", r.stderr)
 
+    # ----- Task 3 -----
+
+    def test_status_merges_doc_and_ai_in_one_roundtrip(self):
+        FakePlugin.responses["batch"] = {
+            "status": "ok", "count": 2,
+            "results": [
+                {"status": "ok", "document": {"name": "x.kra", "width": 800,
+                                              "height": 600, "layers": []}},
+                {"status": "ok", "ai": {"workspace": "generation"},
+                 "regions": [], "styles": []},
+            ],
+        }
+        r = self.kri("status")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        merged = json.loads(r.stdout)
+        self.assertEqual(merged["doc"]["name"], "x.kra")
+        self.assertEqual(merged["ai"]["workspace"], "generation")
+        # exactly ONE round-trip
+        self.assertEqual(len(FakePlugin.requests_log), 1)
+        req = self.last_request()
+        self.assertEqual(req["action"], "batch")
+        self.assertEqual([c["action"] for c in req["params"]["commands"]],
+                         ["doc_info", "ai_overview"])
+
+    def test_status_tolerates_missing_ai_plugin(self):
+        FakePlugin.responses["batch"] = {
+            "status": "ok", "count": 2,
+            "results": [
+                {"status": "ok", "document": None},
+                {"error": "AI Diffusion plugin not loaded: ..."},
+            ],
+        }
+        r = self.kri("status")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        merged = json.loads(r.stdout)
+        self.assertIn("error", merged["ai"])
+
 
 if __name__ == "__main__":
     unittest.main()
