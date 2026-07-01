@@ -122,6 +122,50 @@ class KriTest(unittest.TestCase):
         merged = json.loads(r.stdout)
         self.assertIn("error", merged["ai"])
 
+    # ----- Task 4 -----
+
+    def test_paint_command_mappings(self):
+        """Each CLI invocation maps to the right action + params."""
+        cases = [
+            (["canvas", "800", "600", "--bg", "#ffffff"],
+             "new_canvas", {"width": 800, "height": 600,
+                            "name": "New Canvas", "background": "#ffffff"}),
+            (["color", "#ff0000"], "set_color", {"color": "#ff0000"}),
+            (["brush", "--size", "12"], "set_brush", {"size": 12}),
+            (["stroke", "10,10", "50,60", "--size", "8"],
+             "stroke", {"points": [[10, 10], [50, 60]], "size": 8,
+                        "feather": 0.0, "opacity": 1.0}),
+            (["fill", "100", "120", "30"],
+             "fill", {"x": 100, "y": 120, "radius": 30, "feather": 0.0}),
+            (["shape", "ellipse", "10", "20", "100", "50"],
+             "draw_shape", {"shape": "ellipse", "x": 10, "y": 20,
+                            "width": 100, "height": 50, "fill": True,
+                            "stroke": False, "feather": 0.0}),
+            (["redo"], "redo", {}),
+            (["clear", "#000000"], "clear", {"color": "#000000"}),
+            (["color-at", "5", "6"], "get_color_at", {"x": 5, "y": 6}),
+            (["brushes", "soft", "--limit", "5"],
+             "list_brushes", {"filter": "soft", "limit": 5}),
+        ]
+        for argv, action, params in cases:
+            with self.subTest(argv=argv):
+                FakePlugin.requests_log.clear()
+                r = self.kri(*argv)
+                self.assertEqual(r.returncode, 0, f"{argv}: {r.stderr}")
+                req = self.last_request()
+                self.assertEqual(req["action"], action)
+                self.assertEqual(req["params"], params)
+
+    def test_stroke_rejects_bad_point(self):
+        r = self.kri("stroke", "10,10", "banana")
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("invalid point", r.stderr)
+
+    def test_save_uses_absolute_path(self):
+        r = self.kri("save", "out.png")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertTrue(os.path.isabs(self.last_request()["params"]["path"]))
+
 
 if __name__ == "__main__":
     unittest.main()

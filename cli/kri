@@ -142,6 +142,60 @@ def cmd_undo(a):
     out(send("undo"))
 
 
+def cmd_canvas(a):
+    out(send("new_canvas", {"width": a.width, "height": a.height,
+                            "name": a.name, "background": a.bg}))
+
+
+def cmd_color(a):
+    out(send("set_color", {"color": a.color}))
+
+
+def cmd_brush(a):
+    out(send("set_brush", clean(preset=a.preset, size=a.size, opacity=a.opacity)))
+
+
+def cmd_stroke(a):
+    out(send("stroke", clean(points=parse_points(a.points), size=a.size,
+                             feather=a.feather, opacity=a.opacity)))
+
+
+def cmd_fill(a):
+    out(send("fill", {"x": a.x, "y": a.y, "radius": a.radius,
+                      "feather": a.feather}))
+
+
+def cmd_shape(a):
+    out(send("draw_shape", clean(shape=a.shape, x=a.x, y=a.y, width=a.width,
+                                 height=a.height, fill=not a.no_fill,
+                                 stroke=a.stroke, feather=a.feather,
+                                 x2=a.x2, y2=a.y2, line_width=a.line_width)))
+
+
+def cmd_redo(a):
+    out(send("redo"))
+
+
+def cmd_clear(a):
+    out(send("clear", {"color": a.color}))
+
+
+def cmd_save(a):
+    out(send("save", {"path": os.path.abspath(a.path)}, timeout=120.0))
+
+
+def cmd_open(a):
+    out(send("open_file", {"path": os.path.abspath(a.path)}))
+
+
+def cmd_color_at(a):
+    out(send("get_color_at", {"x": a.x, "y": a.y}))
+
+
+def cmd_brushes(a):
+    out(send("list_brushes", {"filter": a.filter, "limit": a.limit}))
+
+
 def build_parser():
     p = argparse.ArgumentParser(
         prog="kri",
@@ -157,6 +211,76 @@ def build_parser():
 
     sp = sub.add_parser("undo", help="undo last action")
     sp.set_defaults(fn=cmd_undo)
+
+    sp = sub.add_parser("canvas", help="create a new canvas: kri canvas W H")
+    sp.add_argument("width", type=int)
+    sp.add_argument("height", type=int)
+    sp.add_argument("--name", default="New Canvas")
+    sp.add_argument("--bg", default="#1a1a2e")
+    sp.set_defaults(fn=cmd_canvas)
+
+    sp = sub.add_parser("color", help="set foreground color (hex)")
+    sp.add_argument("color")
+    sp.set_defaults(fn=cmd_color)
+
+    sp = sub.add_parser("brush", help="set brush preset/size/opacity")
+    sp.add_argument("--preset")
+    sp.add_argument("--size", type=int)
+    sp.add_argument("--opacity", type=float)
+    sp.set_defaults(fn=cmd_brush)
+
+    sp = sub.add_parser("stroke", help="polyline: kri stroke 100,100 150,120")
+    sp.add_argument("points", nargs="+", metavar="X,Y")
+    sp.add_argument("--size", type=int)
+    sp.add_argument("--feather", type=float, default=0.0)
+    sp.add_argument("--opacity", type=float, default=1.0)
+    sp.set_defaults(fn=cmd_stroke)
+
+    sp = sub.add_parser("fill", help="fill a circle: kri fill X Y [RADIUS]")
+    sp.add_argument("x", type=int)
+    sp.add_argument("y", type=int)
+    sp.add_argument("radius", type=int, nargs="?", default=50)
+    sp.add_argument("--feather", type=float, default=0.0)
+    sp.set_defaults(fn=cmd_fill)
+
+    sp = sub.add_parser("shape", help="draw rectangle/ellipse/line")
+    sp.add_argument("shape", choices=["rectangle", "ellipse", "line"])
+    sp.add_argument("x", type=int)
+    sp.add_argument("y", type=int)
+    sp.add_argument("width", type=int, nargs="?", default=100)
+    sp.add_argument("height", type=int, nargs="?", default=100)
+    sp.add_argument("--no-fill", action="store_true")
+    sp.add_argument("--stroke", action="store_true")
+    sp.add_argument("--feather", type=float, default=0.0)
+    sp.add_argument("--x2", type=int)
+    sp.add_argument("--y2", type=int)
+    sp.add_argument("--line-width", type=int, dest="line_width")
+    sp.set_defaults(fn=cmd_shape)
+
+    sp = sub.add_parser("redo", help="redo last undone action")
+    sp.set_defaults(fn=cmd_redo)
+
+    sp = sub.add_parser("clear", help="clear canvas to a color")
+    sp.add_argument("color", nargs="?", default="#1a1a2e")
+    sp.set_defaults(fn=cmd_clear)
+
+    sp = sub.add_parser("save", help="export canvas to a file")
+    sp.add_argument("path")
+    sp.set_defaults(fn=cmd_save)
+
+    sp = sub.add_parser("open", help="open a file in Krita")
+    sp.add_argument("path")
+    sp.set_defaults(fn=cmd_open)
+
+    sp = sub.add_parser("color-at", help="eyedropper at X Y")
+    sp.add_argument("x", type=int)
+    sp.add_argument("y", type=int)
+    sp.set_defaults(fn=cmd_color_at)
+
+    sp = sub.add_parser("brushes", help="list brush presets")
+    sp.add_argument("filter", nargs="?", default="")
+    sp.add_argument("--limit", type=int, default=20)
+    sp.set_defaults(fn=cmd_brushes)
 
     return p
 
