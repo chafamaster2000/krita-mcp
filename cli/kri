@@ -225,6 +225,114 @@ def cmd_batch(a):
     out(res)
 
 
+def cmd_exec(a):
+    code = read_source(a.file)
+    out(send("exec", {"code": code}, timeout=a.timeout))
+
+
+# ----- AI Diffusion -----
+
+def cmd_ai_status(a):
+    out(send("ai_status"))
+
+
+def cmd_ai_overview(a):
+    out(send("ai_overview"))
+
+
+def cmd_ai_set_prompt(a):
+    if a.positive is None and a.negative is None:
+        print("kri: provide -p/--positive and/or -n/--negative", file=sys.stderr)
+        sys.exit(2)
+    out(send("ai_set_prompt", clean(positive=a.positive, negative=a.negative)))
+
+
+def cmd_ai_set_params(a):
+    params = clean(style=a.style, strength=a.strength, seed=a.seed,
+                   fixed_seed=a.fixed_seed, batch_count=a.batch_count)
+    if not params:
+        print("kri: provide at least one parameter", file=sys.stderr)
+        sys.exit(2)
+    out(send("ai_set_params", params))
+
+
+def cmd_ai_workspace(a):
+    out(send("ai_set_workspace", {"name": a.name}))
+
+
+def cmd_ai_generate(a):
+    res = send("ai_generate")
+    if not isinstance(res, dict) or res.get("error") or not a.wait:
+        out(res)
+    deadline = time.time() + a.timeout
+    last = None
+    while time.time() < deadline:
+        time.sleep(a.poll)
+        st = send("ai_status")
+        if not isinstance(st, dict) or st.get("error"):
+            out(st)
+        last = st
+        q = st.get("queue") or {}
+        if not q.get("queued") and not q.get("executing"):
+            out({"status": "ok", "generate": res, "final": st})
+    out({"error": f"still generating after {a.timeout}s", "last_status": last})
+
+
+def cmd_ai_jobs(a):
+    out(send("ai_list_jobs", {"state": a.state, "limit": a.limit}))
+
+
+def cmd_ai_apply(a):
+    out(send("ai_apply", clean(job_id=a.job_id, index=a.index)))
+
+
+def cmd_ai_cancel(a):
+    out(send("ai_cancel", {"active": True, "queued": a.queued}))
+
+
+def cmd_ai_preview(a):
+    out(send("ai_save_preview", {"job_id": a.job_id, "index": a.index,
+                                 "filename": a.filename}))
+
+
+def cmd_ai_styles(a):
+    out(send("ai_list_styles", {"filter": a.filter, "limit": a.limit}))
+
+
+def cmd_region_create(a):
+    out(send("ai_create_region", {"positive": a.positive, "group": a.group}))
+
+
+def cmd_region_list(a):
+    out(send("ai_list_regions"))
+
+
+def cmd_region_select(a):
+    out(send("ai_select_region", clean(index=a.index, layer_id=a.layer_id)))
+
+
+def cmd_region_remove(a):
+    out(send("ai_remove_region", {"index": a.index}))
+
+
+def cmd_control_add(a):
+    out(send("ai_add_control", clean(mode=a.mode, layer_id=a.layer_id,
+                                     strength=a.strength, region_index=a.region)))
+
+
+def cmd_control_list(a):
+    out(send("ai_list_controls", clean(region_index=a.region)))
+
+
+def cmd_control_set(a):
+    out(send("ai_set_control", clean(index=a.index, mode=a.mode,
+                                     strength=a.strength, region_index=a.region)))
+
+
+def cmd_control_remove(a):
+    out(send("ai_remove_control", clean(index=a.index, region_index=a.region)))
+
+
 def build_parser():
     p = argparse.ArgumentParser(
         prog="kri",
@@ -325,6 +433,112 @@ def build_parser():
                     help="also return the final canvas image")
     sp.add_argument("-o", "--out")
     sp.set_defaults(fn=cmd_batch)
+
+    sp = sub.add_parser("exec",
+                        help="run Python inside Krita (needs KRITAMCP_ALLOW_EXEC=1)")
+    sp.add_argument("file", nargs="?", default="-",
+                    help="script path, or '-' for stdin (default)")
+    sp.add_argument("--timeout", type=float, default=30.0)
+    sp.set_defaults(fn=cmd_exec)
+
+    ai = sub.add_parser("ai", help="AI Diffusion plugin").add_subparsers(
+        dest="ai_cmd", required=True, metavar="ai-command")
+
+    sp = ai.add_parser("status", help="AI state (connection/style/queue/prompt)")
+    sp.set_defaults(fn=cmd_ai_status)
+
+    sp = ai.add_parser("overview", help="raw ai_overview (kri status merges this)")
+    sp.set_defaults(fn=cmd_ai_overview)
+
+    sp = ai.add_parser("set-prompt")
+    sp.add_argument("-p", "--positive")
+    sp.add_argument("-n", "--negative")
+    sp.set_defaults(fn=cmd_ai_set_prompt)
+
+    sp = ai.add_parser("set-params")
+    sp.add_argument("--style")
+    sp.add_argument("--strength", type=float)
+    sp.add_argument("--seed", type=int)
+    sp.add_argument("--fixed-seed", action=argparse.BooleanOptionalAction,
+                    dest="fixed_seed", default=None)
+    sp.add_argument("--batch-count", type=int, dest="batch_count")
+    sp.set_defaults(fn=cmd_ai_set_params)
+
+    sp = ai.add_parser("workspace")
+    sp.add_argument("name", choices=WORKSPACES)
+    sp.set_defaults(fn=cmd_ai_workspace)
+
+    sp = ai.add_parser("generate")
+    sp.add_argument("--wait", action="store_true",
+                    help="block until the job queue drains")
+    sp.add_argument("--timeout", type=float, default=300.0)
+    sp.add_argument("--poll", type=float, default=2.0,
+                    help="seconds between status polls (with --wait)")
+    sp.set_defaults(fn=cmd_ai_generate)
+
+    sp = ai.add_parser("jobs")
+    sp.add_argument("--state", choices=JOB_STATES, default="all")
+    sp.add_argument("--limit", type=int, default=20)
+    sp.set_defaults(fn=cmd_ai_jobs)
+
+    sp = ai.add_parser("apply", help="apply a finished result to the canvas")
+    sp.add_argument("--job-id", dest="job_id")
+    sp.add_argument("--index", type=int, default=0)
+    sp.set_defaults(fn=cmd_ai_apply)
+
+    sp = ai.add_parser("cancel")
+    sp.add_argument("--queued", action="store_true",
+                    help="also cancel queued (not started) jobs")
+    sp.set_defaults(fn=cmd_ai_cancel)
+
+    sp = ai.add_parser("preview", help="save a result image without applying it")
+    sp.add_argument("job_id")
+    sp.add_argument("--index", type=int, default=0)
+    sp.add_argument("--filename", default="")
+    sp.set_defaults(fn=cmd_ai_preview)
+
+    sp = ai.add_parser("styles")
+    sp.add_argument("filter", nargs="?", default="")
+    sp.add_argument("--limit", type=int, default=30)
+    sp.set_defaults(fn=cmd_ai_styles)
+
+    region = ai.add_parser("region", help="region masks").add_subparsers(
+        dest="region_cmd", required=True)
+    sp = region.add_parser("create")
+    sp.add_argument("-p", "--positive", default="")
+    sp.add_argument("--group", action="store_true")
+    sp.set_defaults(fn=cmd_region_create)
+    sp = region.add_parser("list")
+    sp.set_defaults(fn=cmd_region_list)
+    sp = region.add_parser("select", help="no index = select root")
+    sp.add_argument("index", type=int, nargs="?")
+    sp.add_argument("--layer-id", dest="layer_id")
+    sp.set_defaults(fn=cmd_region_select)
+    sp = region.add_parser("remove")
+    sp.add_argument("index", type=int)
+    sp.set_defaults(fn=cmd_region_remove)
+
+    control = ai.add_parser("control", help="ControlNet / IP-Adapter layers"
+                            ).add_subparsers(dest="control_cmd", required=True)
+    sp = control.add_parser("add")
+    sp.add_argument("mode", choices=CONTROL_MODES)
+    sp.add_argument("--layer-id", dest="layer_id")
+    sp.add_argument("--strength", type=float)
+    sp.add_argument("--region", type=int)
+    sp.set_defaults(fn=cmd_control_add)
+    sp = control.add_parser("list")
+    sp.add_argument("--region", type=int)
+    sp.set_defaults(fn=cmd_control_list)
+    sp = control.add_parser("set")
+    sp.add_argument("index", type=int)
+    sp.add_argument("--mode", choices=CONTROL_MODES)
+    sp.add_argument("--strength", type=float)
+    sp.add_argument("--region", type=int)
+    sp.set_defaults(fn=cmd_control_set)
+    sp = control.add_parser("remove")
+    sp.add_argument("index", type=int)
+    sp.add_argument("--region", type=int)
+    sp.set_defaults(fn=cmd_control_remove)
 
     return p
 

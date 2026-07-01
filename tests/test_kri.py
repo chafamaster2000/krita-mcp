@@ -235,6 +235,101 @@ class KriTest(unittest.TestCase):
         r = self.kri("batch", stdin="not json")
         self.assertEqual(r.returncode, 2)
 
+    # ----- Task 6 -----
+
+    def test_ai_command_mappings(self):
+        cases = [
+            (["ai", "status"], "ai_status", {}),
+            (["ai", "overview"], "ai_overview", {}),
+            (["ai", "set-prompt", "-p", "a fox", "-n", "blurry"],
+             "ai_set_prompt", {"positive": "a fox", "negative": "blurry"}),
+            (["ai", "set-params", "--style", "flux", "--strength", "0.7"],
+             "ai_set_params", {"style": "flux", "strength": 0.7}),
+            (["ai", "workspace", "generation"],
+             "ai_set_workspace", {"name": "generation"}),
+            (["ai", "jobs", "--state", "finished", "--limit", "3"],
+             "ai_list_jobs", {"state": "finished", "limit": 3}),
+            (["ai", "apply", "--index", "1"], "ai_apply", {"index": 1}),
+            (["ai", "cancel", "--queued"],
+             "ai_cancel", {"active": True, "queued": True}),
+            (["ai", "preview", "job42", "--index", "2"],
+             "ai_save_preview", {"job_id": "job42", "index": 2, "filename": ""}),
+            (["ai", "styles", "anime"],
+             "ai_list_styles", {"filter": "anime", "limit": 30}),
+            (["ai", "region", "create", "-p", "a dog"],
+             "ai_create_region", {"positive": "a dog", "group": False}),
+            (["ai", "region", "list"], "ai_list_regions", {}),
+            (["ai", "region", "select", "0"], "ai_select_region", {"index": 0}),
+            (["ai", "region", "remove", "1"], "ai_remove_region", {"index": 1}),
+            (["ai", "control", "add", "depth", "--strength", "0.9"],
+             "ai_add_control", {"mode": "depth", "strength": 0.9}),
+            (["ai", "control", "list"], "ai_list_controls", {}),
+            (["ai", "control", "set", "0", "--mode", "pose"],
+             "ai_set_control", {"index": 0, "mode": "pose"}),
+            (["ai", "control", "remove", "0", "--region", "1"],
+             "ai_remove_control", {"index": 0, "region_index": 1}),
+        ]
+        for argv, action, params in cases:
+            with self.subTest(argv=argv):
+                FakePlugin.requests_log.clear()
+                r = self.kri(*argv)
+                self.assertEqual(r.returncode, 0, f"{argv}: {r.stderr}")
+                req = self.last_request()
+                self.assertEqual(req["action"], action)
+                self.assertEqual(req["params"], params)
+
+    def test_set_prompt_requires_p_or_n(self):
+        r = self.kri("ai", "set-prompt")
+        self.assertEqual(r.returncode, 2)
+
+    def test_generate_no_wait_returns_immediately(self):
+        FakePlugin.responses["ai_generate"] = {"status": "ok",
+                                               "workspace": "generation"}
+        r = self.kri("ai", "generate")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(len(FakePlugin.requests_log), 1)
+
+    def test_generate_wait_polls_until_idle(self):
+        FakePlugin.responses["ai_generate"] = {"status": "ok"}
+        FakePlugin.responses["ai_status"] = [
+            {"status": "ok", "queue": {"queued": 1, "executing": 0}},
+            {"status": "ok", "queue": {"queued": 0, "executing": 1}},
+            {"status": "ok", "queue": {"queued": 0, "executing": 0}},
+        ]
+        r = self.kri("ai", "generate", "--wait", "--poll", "0.05")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        final = json.loads(r.stdout)
+        self.assertEqual(final["final"]["queue"]["executing"], 0)
+        status_calls = [q for q in FakePlugin.requests_log
+                        if q["action"] == "ai_status"]
+        self.assertEqual(len(status_calls), 3)
+
+    def test_generate_wait_timeout_exits_1(self):
+        FakePlugin.responses["ai_generate"] = {"status": "ok"}
+        FakePlugin.responses["ai_status"] = {
+            "status": "ok", "queue": {"queued": 0, "executing": 1}}
+        r = self.kri("ai", "generate", "--wait", "--poll", "0.05",
+                     "--timeout", "0.2")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("still generating", r.stderr)
+
+    def test_exec_sends_code_and_timeout(self):
+        FakePlugin.responses["exec"] = {"status": "ok", "stdout": "hi\n"}
+        r = self.kri("exec", "--timeout", "60", stdin='print("hi")')
+        self.assertEqual(r.returncode, 0, r.stderr)
+        req = self.last_request()
+        self.assertEqual(req["action"], "exec")
+        self.assertEqual(req["params"]["code"], 'print("hi")')
+        self.assertEqual(req["timeout"], 60.0)
+
+    def test_exec_disabled_error_surfaces(self):
+        FakePlugin.responses["exec"] = {
+            "error": ("exec is disabled. Start Krita with "
+                      "KRITAMCP_ALLOW_EXEC=1 to enable it.")}
+        r = self.kri("exec", stdin="print(1)")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("KRITAMCP_ALLOW_EXEC", r.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()
