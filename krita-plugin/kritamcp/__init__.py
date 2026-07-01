@@ -825,6 +825,81 @@ class KritaMCPExtension(Extension):
 
         return {"status": "ok", "path": filepath, "name": doc.name(), "width": doc.width(), "height": doc.height()}
 
+    def cmd_doc_info(self, params):
+        """Lightweight document summary for `kri status` — no pixel data."""
+        doc = self.get_active_document()
+        if not doc:
+            return {"status": "ok", "document": None}
+        layers = []
+        for node in doc.topLevelNodes():
+            layers.append({
+                "name": node.name(),
+                "type": node.type(),
+                "visible": node.visible(),
+            })
+        active = doc.activeNode()
+        return {
+            "status": "ok",
+            "document": {
+                "name": doc.name() or "(unsaved)",
+                "width": doc.width(),
+                "height": doc.height(),
+                "active_layer": active.name() if active else None,
+                "layers": layers,
+            },
+        }
+
+    def cmd_exec(self, params):
+        """Execute arbitrary Python inside Krita (`kri exec`). DISABLED unless
+        Krita was started with KRITAMCP_ALLOW_EXEC=1 in its environment.
+
+        Runs on the main GUI thread like every other action. Consequence: a
+        long script blocks Krita's UI until it finishes, and a truly hung
+        script CANNOT be preempted — the HTTP client times out and returns an
+        error, but Krita keeps executing. The skill tells the model to keep
+        scripts short; there is no server-side kill.
+        """
+        if os.environ.get("KRITAMCP_ALLOW_EXEC", "") != "1":
+            return {"error": ("exec is disabled. Start Krita with "
+                              "KRITAMCP_ALLOW_EXEC=1 to enable it.")}
+        code = params.get("code", "")
+        if not code.strip():
+            return {"error": "exec: empty code"}
+        import io
+        import traceback
+        from contextlib import redirect_stdout
+        doc = self.get_active_document()
+        namespace = {
+            "Krita": Krita,
+            "app": Krita.instance(),
+            "doc": doc,
+            "view": self.get_active_view(),
+            "layer": self.get_active_layer(),
+            "QColor": QColor, "QImage": QImage, "QPainter": QPainter,
+            "QPen": QPen, "QBrush": QBrush, "QPainterPath": QPainterPath,
+            "QPointF": QPointF, "QRectF": QRectF, "Qt": Qt,
+        }
+        buf = io.StringIO()
+        try:
+            with redirect_stdout(buf):
+                exec(compile(code, "<kri-exec>", "exec"), namespace)
+        except Exception:
+            return {
+                "error": "exec raised an exception",
+                "traceback": traceback.format_exc(),
+                "stdout": buf.getvalue(),
+            }
+        self._maybe_refresh(doc)
+        result_out = {"status": "ok", "stdout": buf.getvalue()}
+        result = namespace.get("result")
+        if result is not None:
+            try:
+                json.dumps(result)
+                result_out["result"] = result
+            except (TypeError, ValueError):
+                result_out["result"] = repr(result)
+        return result_out
+
     def cmd_batch(self, params):
         """Run several commands in one round-trip.
 
@@ -838,11 +913,17 @@ class KritaMCPExtension(Extension):
             return {"error": "batch 'commands' must be a list"}
 
         review = params.get("review")
+        stop_on_error = bool(params.get("stop_on_error", False))
         results = []
+        stopped_at = None
         self._suppress_refresh = True
         try:
-            for c in commands:
-                results.append(self.execute_command(c))
+            for i, c in enumerate(commands):
+                r = self.execute_command(c)
+                results.append(r)
+                if stop_on_error and isinstance(r, dict) and r.get("error"):
+                    stopped_at = i
+                    break
         finally:
             self._suppress_refresh = False
 
@@ -851,6 +932,8 @@ class KritaMCPExtension(Extension):
             doc.refreshProjection()
 
         out = {"status": "ok", "count": len(results), "results": results}
+        if stopped_at is not None:
+            out["stopped_at"] = stopped_at
         if review:
             mode = review if isinstance(review, str) else "fast"
             out["canvas"] = self.cmd_get_canvas({"mode": mode})
