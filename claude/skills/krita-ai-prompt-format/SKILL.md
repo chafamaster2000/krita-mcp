@@ -1,24 +1,24 @@
 ---
 name: krita-ai-prompt-format
-description: Usar SIEMPRE antes de inyectar o cambiar un prompt en AI Diffusion de Krita vía krita-mcp (krita_ai_set_prompt), al elegir las palabras del positivo o del negativo para una generación en Krita. Cubre clasificar la familia del modelo del estilo activo (Flux, Flux Kontext, Z-Image, Qwen, SD3, SDXL realista = lenguaje natural; Illustrious, NoobAI, Pony, Animagine, anime SDXL/SD1.5 = tags danbooru) y resolver nombres propios desconocidos (personajes, criaturas, lugares de ficción) por web antes de escribir el prompt.
+description: Usar SIEMPRE antes de inyectar o cambiar un prompt en AI Diffusion de Krita vía el CLI kri (kri ai set-prompt), al elegir las palabras del positivo o del negativo para una generación en Krita. Cubre clasificar la familia del modelo del estilo activo (Flux, Flux Kontext, Z-Image, Qwen, SD3, SDXL realista = lenguaje natural; Illustrious, NoobAI, Pony, Animagine, anime SDXL/SD1.5 = tags danbooru) y resolver nombres propios desconocidos (personajes, criaturas, lugares de ficción) por web antes de escribir el prompt.
 metadata:
   type: technique
-  target: krita-mcp + AI Diffusion (Acly/krita-ai-diffusion)
+  target: kri CLI + AI Diffusion (Acly/krita-ai-diffusion)
 ---
 
 # Formatear prompts para el modelo activo en Krita (AI Diffusion)
 
 ## Principio
 
-**Nunca escribas un prompt a ciegas.** Cada familia de modelo quiere un *idioma* de prompt distinto: lenguaje natural (frases) vs. tags danbooru (palabras separadas por comas). Poner tags booru en un modelo de lenguaje natural —o viceversa— degrada el resultado. Antes de cada `krita_ai_set_prompt`, mirá qué estilo está activo, clasificá su familia, y formateá positivo + negativo para esa familia.
+**Nunca escribas un prompt a ciegas.** Cada familia de modelo quiere un *idioma* de prompt distinto: lenguaje natural (frases) vs. tags danbooru (palabras separadas por comas). Poner tags booru en un modelo de lenguaje natural —o viceversa— degrada el resultado. Antes de cada `kri ai set-prompt`, mirá qué estilo está activo, clasificá su familia, y formateá positivo + negativo para esa familia.
 
-## El workflow de hierro (antes de CADA `krita_ai_set_prompt`)
+## El workflow de hierro (antes de CADA `kri ai set-prompt`)
 
-1. **Leé el estado.** Llamá `krita_ai_status` (o `krita_ai_overview`). Mirá `model.architecture` (**dato duro**, el resuelto del checkpoint, ej. `"sdxl"`, `"flux"`, `"zimage"`, `"illu"`, `"qwen"`, `"sd3"`), `model.checkpoint`, y como respaldo el `style` filename. Mirá también `prompt.positive` / `prompt.negative` actuales.
+1. **Leé el estado.** Llamá `kri ai status` (o `kri status`). Mirá `model.architecture` (**dato duro**, el resuelto del checkpoint, ej. `"sdxl"`, `"flux"`, `"zimage"`, `"illu"`, `"qwen"`, `"sd3"`), `model.checkpoint`, y como respaldo el `style` filename. Mirá también `prompt.positive` / `prompt.negative` actuales.
 2. **Clasificá la familia** con la **Tabla A (por architecture)**. Si `model.architecture` es `sdxl`/`sd15`/`auto` o `model.available` es false (versión vieja del plugin), usá la **Tabla B (por nombre)** sobre el checkpoint y el style filename/name en minúsculas. Si nada matchea → **no adivines** (ver "Cuando la familia no es obvia").
 3. **Resolvé nombres propios desconocidos.** Si el prompt menciona un personaje/criatura/lugar de ficción que no es una mega-celebridad real, googlealo primero → **REQUERIDO:** [[image-prompt-unknown-entities]].
 4. **Reescribí** positivo + negativo en la convención de esa familia.
-5. **Inyectá** con `krita_ai_set_prompt`. (Si vas a cambiar el estilo, usá `krita_ai_set_params` y volvé al paso 1: el estilo nuevo puede cambiar la convención.)
+5. **Inyectá** con `kri ai set-prompt`. (Si vas a cambiar el estilo, usá `kri ai set-params` y volvé al paso 1: el estilo nuevo puede cambiar la convención.)
 6. **Antes de generar**, pasá el prompt final por [[image-prompt-sanity-check]].
 
 ## Tabla A — por `model.architecture` (dato duro, preferí esta)
@@ -54,7 +54,7 @@ Matcheá keyword en el `model.checkpoint` y en el `style` filename/name (minúsc
 
 No inventes la convención. En orden:
 1. Mirá `model.checkpoint` (de `ai_status`) — suele tener el nombre real (`ponyRealism`, `noobaiXL`, etc.).
-2. `krita_ai_list_styles` por si el name da una pista.
+2. `kri ai styles` por si el name da una pista.
 3. Si sigue ambiguo, **preguntale al usuario** qué checkpoint corre ese estilo, o web-searcheá el nombre del checkpoint.
 4. Default conservador solo si todo falla: lenguaje natural **+** una línea breve de tags, y avisá al usuario que estás adivinando.
 
@@ -93,19 +93,19 @@ Si el prompt nombra una entidad propia que no es una mega-celebridad/marca/landm
 | Pony | `score_4, score_5, score_6, worst quality, low quality` + lo que no querés. |
 | Illustrious / NoobAI / Animagine / anime | `worst quality, low quality, lowres, bad anatomy, bad hands, jpeg artifacts, watermark, signature`. |
 
-Recordá: `krita_ai_set_prompt` escribe el positivo en la región activa (o root) y el negativo **siempre en el root**.
+Recordá: `kri ai set-prompt` escribe el positivo en la región activa (o root) y el negativo **siempre en el root**.
 
 ## Quick reference
 
-1. `krita_ai_status` → mirá `model.architecture` (y `model.checkpoint`).
+1. `kri ai status` → mirá `model.architecture` (y `model.checkpoint`).
 2. Clasificá: Tabla A; si es `sdxl`/`sd15`/`auto`, Tabla B. ¿Ambiguo? No adivines.
 3. ¿Nombre propio raro? Web search.
 4. Reescribí positivo + negativo en la convención.
-5. `krita_ai_set_prompt`.
+5. `kri ai set-prompt`.
 
 ## Errores comunes
 
-- **Inyectar sin chequear el estilo** → el error #1. Siempre `ai_status` primero.
+- **Inyectar sin chequear el estilo** → el error #1. Siempre `kri status` primero.
 - **Tags booru en Flux/Z-Image** (o frases en Pony/Illustrious) → resultado pobre.
 - **Mandar negativo a Flux/Z-Image** → esfuerzo perdido; dejalo vacío.
 - **Parafrasear un nombre propio sin googlear** → "Deku Tree" → genérico.

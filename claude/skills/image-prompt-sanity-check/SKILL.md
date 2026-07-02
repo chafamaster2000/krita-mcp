@@ -1,25 +1,25 @@
 ---
 name: image-prompt-sanity-check
-description: Usar como última compuerta ANTES de lanzar una generación en Krita AI Diffusion (krita_ai_generate), y después de cualquier cambio de prompt o de estilo/modelo — para revisar que el prompt final siga siendo coherente con el modelo activo y con lo que pidió el usuario antes de gastar la generación. Atrapa restos de ediciones, contradicciones, convención equivocada tras cambiar de estilo, nombres propios sin resolver y negativos que pelean con el positivo.
+description: Usar como última compuerta ANTES de lanzar una generación en Krita AI Diffusion (kri ai generate), y después de cualquier cambio de prompt o de estilo/modelo — para revisar que el prompt final siga siendo coherente con el modelo activo y con lo que pidió el usuario antes de gastar la generación. Atrapa restos de ediciones, contradicciones, convención equivocada tras cambiar de estilo, nombres propios sin resolver y negativos que pelean con el positivo.
 metadata:
   type: technique
-  target: krita-mcp + AI Diffusion
+  target: kri CLI + AI Diffusion
 ---
 
 # Sanity check del prompt antes de lanzar
 
 ## Principio
 
-**Cambiar algo y lanzar sin releer es donde se cuela el error.** Cambiaste el estilo (puede dar vuelta la convención), editaste medio prompt (quedaron restos), reusaste un prompt de otro modelo... Antes de `krita_ai_generate`, revisá que el prompt final sea **coherente con el modelo activo** y **fiel a la intención del usuario**. Es una compuerta de lectura, no de reescritura: o pasa, o devolvés una lista corta de fixes.
+**Cambiar algo y lanzar sin releer es donde se cuela el error.** Cambiaste el estilo (puede dar vuelta la convención), editaste medio prompt (quedaron restos), reusaste un prompt de otro modelo... Antes de `kri ai generate`, revisá que el prompt final sea **coherente con el modelo activo** y **fiel a la intención del usuario**. Es una compuerta de lectura, no de reescritura: o pasa, o devolvés una lista corta de fixes.
 
 ## Cuándo correrlo
 
-- **Siempre antes de `krita_ai_generate`.**
-- Después de `krita_ai_set_params(style=...)` — cambiar de estilo puede cambiar la familia (natural ↔ tags).
+- **Siempre antes de `kri ai generate`.**
+- Después de `kri ai set-params(style=...)` — cambiar de estilo puede cambiar la familia (natural ↔ tags).
 - Después de editar parcialmente el positivo/negativo.
 - Al reusar un prompt escrito para otro modelo.
 
-## Checklist (releé `krita_ai_status` primero)
+## Checklist (releé `kri ai status` primero)
 
 1. **Convención correcta para el modelo activo.** Mirá `model.architecture`. ¿El positivo está en la convención de esa familia (lenguaje natural vs tags danbooru)? Si cambiaste de estilo, ¿el prompt sigue en el formato viejo? → ver [[krita-ai-prompt-format]].
 2. **Intención del usuario preservada.** Sujeto, acción, estilo, mood, encuadre que pidió: ¿están todos? ¿Se coló algo que NO pidió? ¿Se perdió algo en la reescritura?
@@ -33,8 +33,8 @@ metadata:
 
 ## Salida
 
-- **PASS** → seguí con `krita_ai_generate`.
-- **Si falla algo** → listá los fixes concretos, corregí con `krita_ai_set_prompt`, y recién ahí generá. No lances con issues conocidos "a ver qué sale".
+- **PASS** → seguí con `kri ai generate`.
+- **Si falla algo** → listá los fixes concretos, corregí con `kri ai set-prompt`, y recién ahí generá. No lances con issues conocidos "a ver qué sale".
 
 ## Errores comunes
 
