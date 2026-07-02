@@ -1,11 +1,12 @@
-# Krita MCP — talk to your AI assistant, it drives Krita for you
+# kri — talk to your AI assistant, it drives Krita for you
 
 > A fork of [nanayax3/krita-mcp](https://github.com/nanayax3/krita-mcp) that adds a
-> live bridge to [Acly/krita-ai-diffusion](https://github.com/Acly/krita-ai-diffusion).
-> You describe what you want in plain language; an AI assistant (Claude, or any
-> MCP client) sets the prompt, switches style, paints rough region masks,
-> generates, shows you the result, and applies it — **all inside your real,
-> open Krita document.** Your layers, your canvas, your undo history.
+> live bridge to [Acly/krita-ai-diffusion](https://github.com/Acly/krita-ai-diffusion),
+> driven by a zero-dependency CLI (`kri`) instead of an MCP server.
+> You describe what you want in plain language; an AI assistant with shell access
+> (Claude Code, or any coding agent) sets the prompt, switches style, paints rough
+> region masks, generates, shows you the result, and applies it — **all inside your
+> real, open Krita document.** Your layers, your canvas, your undo history.
 
 ## What this is, for an artist
 
@@ -58,9 +59,9 @@ There are three pieces in a chain. The key trick is in the last hop.
 You (in a chat)
    │  "put a bear on the left…"
    ▼
-AI assistant  ──MCP──►  MCP Server (server.py)  ──HTTP :5678──►  Krita plugin (kritamcp)
-   (Claude, etc.)        translates a tool call          runs the command on Krita's
-                         into one HTTP request            main UI thread
+AI assistant  ──Bash──►  kri CLI (cli/kri)  ──HTTP :5678──►  Krita plugin (kritamcp)
+   (Claude Code, etc.)    translates a subcommand      runs the command on Krita's
+                          into one HTTP request         main UI thread
                                                                   │
                                                                   │  in-process import
                                                                   ▼
@@ -72,14 +73,14 @@ AI assistant  ──MCP──►  MCP Server (server.py)  ──HTTP :5678──
                                                           (does the actual diffusion)
 ```
 
-1. **The AI assistant** speaks **MCP** (Model Context Protocol) — a standard way
-   for an assistant to call "tools." Each tool here is one Krita action:
-   `krita_new_canvas`, `krita_ai_generate`, etc.
+1. **The AI assistant** runs shell commands. Each `kri` subcommand is one Krita
+   action: `kri canvas`, `kri ai generate`, etc. — and `kri batch` packs many
+   actions into a single invocation (one assistant turn instead of ten).
 
-2. **The MCP Server** (`server.py`) is a small Python program. It advertises those
-   tools to the assistant, validates the arguments, and turns each tool call into
-   a single HTTP request to `localhost:5678`. It runs on your machine, alongside
-   the assistant.
+2. **The `kri` CLI** (`cli/kri`) is a single-file, stdlib-only Python script. It
+   validates arguments (argparse choices/types) and turns each subcommand into
+   a single HTTP request to `localhost:5678`. No venv, no dependencies, ~50 ms
+   startup.
 
 3. **The Krita plugin** (`krita-plugin/kritamcp/`) runs *inside* Krita. It listens
    on `localhost:5678`, and when a command arrives it executes it **on Krita's
@@ -121,11 +122,11 @@ required.**
 
 ## Setup
 
-### 1. Install Krita AI Diffusion (required for the `krita_ai_*` tools)
+### 1. Install Krita AI Diffusion (required for the `kri ai …` commands)
 
 Follow the official guide: <https://github.com/Acly/krita-ai-diffusion>. The
 plugin must be installed and its ComfyUI backend reachable. Without it, the
-painting tools still work, but every `krita_ai_*` tool returns an error.
+painting commands still work, but every `kri ai …` command returns an error.
 
 ### 2. Install this bridge plugin into Krita
 
@@ -145,37 +146,44 @@ Then in Krita: **Settings → Configure Krita → Python Plugin Manager → enab
 server on port `5678`; if that port is taken it pops up a warning instead of
 failing silently.
 
-### 3. Install the MCP server (on your machine)
+### 3. Install the `kri` CLI (on your machine)
+
+No dependencies, no venv — it's one stdlib-only Python file:
 
 ```bash
-pip install fastmcp httpx
+ln -sf "$PWD/cli/kri" ~/.local/bin/kri     # make sure ~/.local/bin is on PATH
+kri health                                  # → {"status": "ok", "plugin": "kritamcp"}
 ```
 
-Or with a virtual environment:
+Everyday flow with an assistant (or by hand):
 
 ```bash
-python -m venv .venv
-source .venv/bin/activate          # Windows: .venv\Scripts\activate
-pip install -r requirements.txt
+kri status                 # document + AI Diffusion state, one call
+kri look                   # canvas → /tmp/kri-canvas.jpg (the assistant Reads it)
+kri batch <<'EOF'          # many steps, one round-trip
+[{"action": "set_color", "params": {"color": "#ffffff"}},
+ {"action": "fill", "params": {"x": 100, "y": 100, "radius": 80}}]
+EOF
+kri ai generate --wait     # generate and block until the queue drains
 ```
 
-### 4. Point your MCP client at the server
-
-For example, Claude Desktop's `claude_desktop_config.json`:
+`kri --help` / `kri <cmd> --help` list everything. For Claude Code, allowlist it
+in `settings.json` so every call runs unprompted except `exec`:
 
 ```json
-{
-  "mcpServers": {
-    "krita": {
-      "command": "python",
-      "args": ["/path/to/server.py"]
-    }
-  }
+"permissions": {
+  "allow": ["Bash(kri:*)"],
+  "ask": ["Bash(kri exec:*)"]
 }
 ```
 
-If you used a virtualenv, set `command` to that venv's Python so `fastmcp` and
-`httpx` are importable.
+### 4. (Optional) `kri exec` — arbitrary Python inside Krita
+
+Escape hatch for anything without a subcommand: launch Krita with
+`KRITAMCP_ALLOW_EXEC=1` in its environment, then pipe a script to `kri exec`.
+It runs on Krita's main thread with `app`/`doc`/`view`/`layer` and the Qt paint
+classes in scope; `print()` output and tracebacks come back in the response.
+Off by default.
 
 ### 5. (Optional) Prompt-formatting skills + reminder hook
 
@@ -194,12 +202,13 @@ cp claude/hooks/krita-prompt-reminder.py ~/.claude/hooks/
 Three skills carry the knowledge (`krita-ai-prompt-format`,
 `image-prompt-unknown-entities`, `image-prompt-sanity-check`), and a
 reminder-only `PreToolUse` hook injects the active model's family before
-`set_prompt`/`generate`. Wire the hook in your `settings.json`:
+`kri ai set-prompt` / `kri ai generate` (it matches on the Bash command text and
+stays silent for anything else). Wire the hook in your `settings.json`:
 
 ```json
 "PreToolUse": [
   {
-    "matcher": "mcp__krita__krita_ai_set_prompt|mcp__krita__krita_ai_generate",
+    "matcher": "Bash",
     "hooks": [
       { "type": "command", "command": "python3 \"$HOME/.claude/hooks/krita-prompt-reminder.py\"", "timeout": 8 }
     ]
@@ -212,55 +221,58 @@ blocks a call. Restart Claude Code (or run `/hooks`) to load it.
 
 ---
 
-## The tools
+## The commands
 
-All tools run against the document currently open in Krita.
+All commands run against the document currently open in Krita. Every command
+prints JSON and exits non-zero on error, so `kri a && kri b` chains stop at the
+first failure.
 
 ### Painting & canvas
 
-| Tool | What it does |
+| Command | What it does |
 |------|--------------|
-| `krita_health` | Is Krita up with the plugin active? |
-| `krita_new_canvas` | New canvas (width, height, name, background) — fills a visible paint layer and makes it active |
-| `krita_open_file` | Open an existing `.kra`, `.png`, `.jpg`, … |
-| `krita_set_color` | Set foreground paint color (hex) |
-| `krita_set_brush` | Pick a brush preset (partial name match), size, opacity |
-| `krita_stroke` | Paint an antialiased stroke through `[[x,y], …]` points, with optional `feather` |
-| `krita_fill` | Antialiased filled circle at a point (great for mask blobs) |
-| `krita_draw_shape` | Rectangle / ellipse / line, fill or outline, optional `feather` |
-| `krita_clear` | Flood the active layer with one solid color |
-| `krita_get_color_at` | Eyedropper — sample the pixel at (x, y) |
-| `krita_list_brushes` | List brush presets (filter, limit) |
-| `krita_get_canvas` | **Look at the canvas inline.** `mode="fast"` (default) = small JPEG for the working loop; `mode="full"` = full-res PNG for final review |
-| `krita_save` | Export the document to a file path |
-| `krita_undo` / `krita_redo` | Step the undo history |
-| `krita_batch` | **Run many commands in ONE round-trip** + optionally return the canvas. Use whenever you'd otherwise chain calls (e.g. several fills to build a mask) |
+| `kri health` | Is Krita up with the plugin active? |
+| `kri canvas` | New canvas (width, height, name, background) — fills a visible paint layer and makes it active |
+| `kri open` | Open an existing `.kra`, `.png`, `.jpg`, … |
+| `kri color` | Set foreground paint color (hex) |
+| `kri brush` | Pick a brush preset (partial name match), size, opacity |
+| `kri stroke` | Paint an antialiased stroke through points: `kri stroke 100,100 150,120`, optional `--feather` |
+| `kri fill` | Antialiased filled circle at a point (great for mask blobs) |
+| `kri shape` | Rectangle / ellipse / line, fill or outline, optional `feather` |
+| `kri clear` | Flood the active layer with one solid color |
+| `kri color-at` | Eyedropper — sample the pixel at (x, y) |
+| `kri brushes` | List brush presets (filter, limit) |
+| `kri look` | **Look at the canvas.** Writes the image to a file (default `/tmp/kri-canvas.jpg`) and prints the path — the assistant Reads it. Default = small JPEG for the working loop; `--full` = full-res PNG for final review |
+| `kri save` | Export the document to a file path |
+| `kri undo` / `kri redo` | Step the undo history |
+| `kri batch` | **Run many actions in ONE round-trip** (JSON via stdin or file), stopping at the first error; `--look fast` also returns the final canvas. Use whenever you'd otherwise chain calls (e.g. several fills to build a mask) |
+| `kri exec` | Arbitrary Python inside Krita (requires `KRITAMCP_ALLOW_EXEC=1` at Krita launch) |
 
 ### AI Diffusion bridge
 
-| Tool | What it does |
+| Command | What it does |
 |------|--------------|
-| `krita_ai_overview` | **The whole AI state in one call:** connection, workspace, style, strength/seed, queue, all regions, all control layers, recent jobs, available styles. Prefer this over chaining the read-only tools below |
-| `krita_ai_status` | Lighter snapshot: connection, document, workspace, style, strength/seed, queue counts, current prompt, and the resolved **model architecture** |
-| `krita_ai_list_styles` | List AI Diffusion style presets (filter, limit) |
-| `krita_ai_set_params` | Set style, strength, seed, fixed_seed, batch_count |
-| `krita_ai_set_prompt` | Set positive (on active region or root) and/or negative (always root) prompt |
-| `krita_ai_set_workspace` | Switch workspace: `generation` / `upscaling` / `live` / `animation` / `custom` |
-| `krita_ai_generate` | Trigger generation in the current workspace (returns immediately) |
-| `krita_ai_list_jobs` | List jobs newest-first (id, state, prompt, result count) |
-| `krita_ai_apply` | Apply a finished job's result to the canvas (no `job_id` → latest) |
-| `krita_ai_save_preview` | Save a result to disk **without** applying it, for review |
-| `krita_ai_cancel` | Cancel the active job and/or all queued jobs |
+| `kri status` | **The whole AI state in one call:** connection, workspace, style, strength/seed, queue, all regions, all control layers, recent jobs, available styles. Prefer this over chaining the read-only tools below |
+| `kri ai status` | Lighter snapshot: connection, document, workspace, style, strength/seed, queue counts, current prompt, and the resolved **model architecture** |
+| `kri ai styles` | List AI Diffusion style presets (filter, limit) |
+| `kri ai set-params` | Set style, strength, seed, fixed_seed, batch_count |
+| `kri ai set-prompt` | Set positive (on active region or root) and/or negative (always root) prompt |
+| `kri ai workspace` | Switch workspace: `generation` / `upscaling` / `live` / `animation` / `custom` |
+| `kri ai generate` | Trigger generation in the current workspace; `--wait` blocks until the queue drains (no manual polling) |
+| `kri ai jobs` | List jobs newest-first (id, state, prompt, result count) |
+| `kri ai apply` | Apply a finished job's result to the canvas (no `job_id` → latest) |
+| `kri ai preview` | Save a result to disk **without** applying it, for review |
+| `kri ai cancel` | Cancel the active job and/or all queued jobs |
 | **Regions** | |
-| `krita_ai_create_region` | Make a region + a **fresh transparent paint layer**, set its prompt, activate the layer so painting tools draw its mask |
-| `krita_ai_list_regions` | Root prompt + every child region with layer ids, prompts, active flag |
-| `krita_ai_select_region` | Select a region by index or layer_id (no args = root) |
-| `krita_ai_remove_region` | Remove a region by index |
+| `kri ai region create` | Make a region + a **fresh transparent paint layer**, set its prompt, activate the layer so painting tools draw its mask |
+| `kri ai region list` | Root prompt + every child region with layer ids, prompts, active flag |
+| `kri ai region select` | Select a region by index or layer_id (no args = root) |
+| `kri ai region remove` | Remove a region by index |
 | **Control Layers** (ControlNet / IP-Adapter) | |
-| `krita_ai_add_control` | Add a control to root or a region: `scribble`, `line_art`, `canny_edge`, `depth`, `pose`, `segmentation`, … (ControlNet) or `reference`, `style`, `composition`, `face` (IP-Adapter) |
-| `krita_ai_list_controls` | List control layers across root + all regions (or one scope) |
-| `krita_ai_set_control` | Change an existing control's mode / strength |
-| `krita_ai_remove_control` | Remove a control by index |
+| `kri ai control add` | Add a control to root or a region: `scribble`, `line_art`, `canny_edge`, `depth`, `pose`, `segmentation`, … (ControlNet) or `reference`, `style`, `composition`, `face` (IP-Adapter) |
+| `kri ai control list` | List control layers across root + all regions (or one scope) |
+| `kri ai control set` | Change an existing control's mode / strength |
+| `kri ai control remove` | Remove a control by index |
 
 ---
 
@@ -268,14 +280,12 @@ All tools run against the document currently open in Krita.
 
 ### A — One image from a prompt
 
-```text
-1. krita_new_canvas(1024, 1024, background="#ffffff")
-2. krita_ai_set_params(style="cinematic-photo-xl")
-3. krita_ai_set_prompt(positive="a lighthouse on a cliff at dusk, stormy sea")
-4. krita_ai_generate()
-5. krita_ai_list_jobs()            # poll until state == "finished"
-6. krita_get_canvas(mode="full")   # or save_preview to review off-canvas
-7. krita_ai_apply()                # apply the latest finished result
+```bash
+kri canvas 1024 1024 --bg "#ffffff"
+kri ai set-params --style "cinematic-photo-xl"
+kri ai set-prompt -p "a lighthouse on a cliff at dusk, stormy sea"
+kri ai generate --wait          # blocks until the job finishes
+kri ai apply && kri look --full # apply the latest result, review full-res
 ```
 
 ### B — Two subjects, placed by region
@@ -283,33 +293,35 @@ All tools run against the document currently open in Krita.
 Regions let you say "*this* prompt belongs in *this* area." You paint a rough
 silhouette on each region's mask layer.
 
-```text
-1. krita_new_canvas(1024, 1024, background="#ffffff")
-2. krita_ai_set_params(style="juggernaut-xl")
-3. krita_ai_set_prompt(positive="snowy mountain valley, golden hour")  # root = scene
-4. krita_ai_create_region(positive="grizzly bear standing on snow")
-   → activates a fresh transparent layer for its mask
-5. krita_set_color("#6b4226")
-6. krita_draw_shape(shape="ellipse", x=70, y=520, width=420, height=320)
-   … (or use krita_batch to paint the whole silhouette in one round-trip)
-7. krita_ai_create_region(positive="timber wolf, alert, side profile")
-8. … paint the wolf silhouette on the new layer
-9. krita_ai_select_region()        # deselect → root active
-10. krita_ai_generate()
-11. krita_ai_list_jobs()           # poll until finished
-12. krita_ai_apply()
+```bash
+# scene + both regions with their masks, in ONE round-trip
+kri batch <<'EOF'
+[{"action": "new_canvas", "params": {"width": 1024, "height": 1024, "background": "#ffffff"}},
+ {"action": "ai_set_params", "params": {"style": "juggernaut-xl"}},
+ {"action": "ai_set_prompt", "params": {"positive": "snowy mountain valley, golden hour"}},
+ {"action": "ai_create_region", "params": {"positive": "grizzly bear standing on snow"}},
+ {"action": "set_color", "params": {"color": "#6b4226"}},
+ {"action": "draw_shape", "params": {"shape": "ellipse", "x": 70, "y": 520, "width": 420, "height": 320}},
+ {"action": "ai_create_region", "params": {"positive": "timber wolf, alert, side profile"}},
+ {"action": "draw_shape", "params": {"shape": "ellipse", "x": 560, "y": 560, "width": 380, "height": 300}},
+ {"action": "ai_select_region", "params": {}}]
+EOF
+kri ai generate --wait && kri ai apply && kri look
 ```
+
+Each `ai_create_region` activates a fresh transparent layer, so the shapes that
+follow it paint *that* region's silhouette mask.
 
 ### C — Restyle an existing image (img2img / refine)
 
 Set `strength` below `1.0` and AI Diffusion switches to **refine**: your current
 canvas becomes the img2img source instead of starting from noise.
 
-```text
-1. krita_open_file("/path/to/photo.png")
-2. krita_ai_set_params(style="digital-artwork-xl", strength=0.6)
-3. krita_ai_set_prompt(positive="oil painting, thick impasto brushwork")
-4. krita_ai_generate()  →  list_jobs  →  apply
+```bash
+kri open /path/to/photo.png
+kri ai set-params --style "digital-artwork-xl" --strength 0.6
+kri ai set-prompt -p "oil painting, thick impasto brushwork"
+kri ai generate --wait && kri ai apply
 ```
 
 ### D — Force structure with a Control Layer
@@ -318,11 +330,11 @@ Regions constrain *where a prompt applies*; they don't force a subject to appear
 in a precise shape. For strict pose/outline/composition, add a Control Layer that
 reads from a layer you've drawn on:
 
-```text
-1. … draw a scribble / line-art / pose on a layer
-2. krita_ai_add_control(mode="scribble", strength=0.7)   # sources the active layer
-3. krita_ai_set_prompt(positive="a knight in plate armor")
-4. krita_ai_generate()
+```bash
+# … draw a scribble / line-art / pose on a layer, then:
+kri ai control add scribble --strength 0.7   # sources the active layer
+kri ai set-prompt -p "a knight in plate armor"
+kri ai generate --wait
 ```
 
 ---
@@ -332,7 +344,7 @@ reads from a layer you've drawn on:
 **Every diffusion model family wants a different prompt *language*.** Feeding
 danbooru tags to a natural-language model — or full sentences to a booru anime
 model — visibly degrades the result. The rule: **before every
-`krita_ai_set_prompt`, check the active style's model and write in its dialect.**
+`kri ai set-prompt`, check the active style's model and write in its dialect.**
 
 | Family (by resolved architecture) | Prompt convention | Negative prompt |
 |---|---|---|
@@ -342,8 +354,8 @@ model — visibly degrades the result. The rule: **before every
 Two more rules the assistant follows:
 
 - **Classify by architecture, not by the style's name.** A style called
-  "Realistic" can run on an anime checkpoint. `krita_ai_status` /
-  `krita_ai_overview` return a `model` block with the resolved `architecture`
+  "Realistic" can run on an anime checkpoint. `kri ai status` /
+  `kri status` return a `model` block with the resolved `architecture`
   (`flux`, `zimage`, `illu`, `qwen`, `sd3`, `sdxl`, …), `checkpoint` and `loras`
   — decide from that. `sdxl`/`sd15` are ambiguous (used by both booru and
   natural-language checkpoints), so fall back to the checkpoint/style name; if
@@ -383,36 +395,38 @@ plugin.
   most reliable per-region adherence. Turbo / 1-step models (Z-Image Turbo)
   effectively skip regional conditioning; Flux variants are prompt-literal and
   tend to render only the global scene when the root is strong.
-- **Generation is asynchronous.** `krita_ai_generate` returns the moment the job
-  is *queued*, not when the image is done. Poll `krita_ai_list_jobs` (or
-  `krita_ai_status`) until the job is `finished` before applying.
+- **Generation is asynchronous.** `kri ai generate` returns the moment the job
+  is *queued*, not when the image is done. Use `--wait` to block until the queue
+  drains (it polls `ai_status` internally), then apply.
 
 ---
 
 ## Performance: why it feels snappy
 
-Most of the speed-up in this fork wasn't faster computation — it was **removing
-round-trip tax.** Every assistant→server→plugin→server→assistant hop has latency;
-the wins come from making fewer, fatter hops and never blocking on a poll.
+Most of the speed-up in this project wasn't faster computation — it was
+**removing round-trip tax.** For an AI assistant the expensive hop is its own
+turn (a full model inference per command), so the wins come from doing more per
+invocation and never blocking on a poll.
 
-- **Event-driven command queue.** The HTTP worker thread and Krita's main thread
-  hand off through a per-command `threading.Event`, and a Qt signal wakes the main
-  thread the instant a command lands — no 250 ms polling on the hot path (a slow
-  fallback timer remains only as a safety net).
-- **Persistent HTTP connection.** The MCP server keeps one `httpx.Client` open and
-  reuses the socket instead of paying a TCP handshake per call.
-- **`krita_batch`.** Bundle "set color + three fills + draw shape" into one
+- **CLI over MCP.** No tool schemas inflating the assistant's context, no server
+  process; a stdlib-only script that starts in ~50 ms. (The MCP server this repo
+  used to ship was retired — see tag `v-mcp-final`.)
+- **`kri status`.** Document + the whole AI state in one invocation instead of
+  chaining `health` + `status` + `region list` + `control list` + `styles`.
+- **`kri batch`.** Bundle "set color + three fills + draw shape" into one
   request; the projection refreshes **once at the end**, not per command.
-- **`krita_ai_overview`.** Read all AI state in a single call instead of chaining
-  `status` + `list_regions` + `list_controls` + `list_jobs` + `list_styles`.
-- **`krita_get_canvas(mode="fast")`.** A small JPEG for the iteration loop costs a
-  fraction of the vision tokens of a full-res PNG; switch to `mode="full"` only
-  for the final look.
+- **`kri ai generate --wait`.** One invocation that blocks until the job is done
+  — the assistant doesn't burn turns polling `kri ai jobs`.
+- **`kri look`.** A small JPEG for the iteration loop costs a fraction of the
+  vision tokens of a full-res PNG; `--full` only for the final look.
+- **Event-driven command queue (plugin side).** The HTTP worker thread and
+  Krita's main thread hand off through a per-command `threading.Event`, and a Qt
+  signal wakes the main thread the instant a command lands — no 250 ms polling
+  on the hot path (a slow fallback timer remains only as a safety net).
 
-The export/save timeout is bumped to **120 s** on both sides (server transport and
-the plugin's command-queue wait), because full-resolution render/export of a large
-canvas can easily exceed the default 30 s. If you add a long-running command,
-pass an extended `timeout` to `send_command(...)` on both sides.
+The export/save timeout is bumped to **120 s** on both sides (CLI transport and
+the plugin's command-queue wait), because full-resolution render/export of a
+large canvas can easily exceed the default 30 s.
 
 ---
 
@@ -438,9 +452,11 @@ output, and no dependence on Krita's internal brush state.
 | Setting | Default | How to change |
 |---------|---------|---------------|
 | Plugin HTTP port | `5678` | `SERVER_PORT` in the plugin `__init__.py` |
-| MCP server URL | `http://localhost:5678` | `KRITA_URL` env var |
+| CLI endpoint | `http://localhost:5678` | `KRITA_URL` env var |
+| `kri look` output path | `/tmp/kri-canvas.jpg` | `KRI_LOOK_PATH` env var or `-o` |
 | Canvas/preview output dir | `~/krita-mcp-output` | `CANVAS_OUTPUT_DIR` in the plugin |
-| Shared auth token | _(none)_ | Set `KRITAMCP_TOKEN` to the **same** value for both the plugin (env at Krita launch) and the MCP server |
+| `kri exec` gate | disabled | `KRITAMCP_ALLOW_EXEC=1` in Krita's environment |
+| Shared auth token | _(none)_ | Set `KRITAMCP_TOKEN` to the **same** value for both the plugin (env at Krita launch) and your shell |
 
 ### Security model
 
@@ -449,20 +465,23 @@ reach it. Two further guards block the classic threat of a malicious local web
 page driving Krita (CSRF / DNS-rebinding against a localhost server):
 
 - **Origin guard (always on).** Any request carrying an `Origin` or `Referer`
-  header is rejected with `403`. A real MCP client speaks plain HTTP and sends
+  header is rejected with `403`. The `kri` CLI speaks plain HTTP and sends
   neither; a browser always sends one.
 - **Shared token (optional).** Set `KRITAMCP_TOKEN` to require an
   `X-Kritamcp-Token` header on every request — same value in the env Krita
-  launches from and for the MCP server.
+  launches from and in the shell running `kri`.
+- **`kri exec` is double-gated.** Disabled in the plugin unless Krita starts
+  with `KRITAMCP_ALLOW_EXEC=1`, and (with Claude Code) listed under `ask`
+  permissions so it always prompts.
 
 Also note: action dispatch is an **allow-list by construction** — an incoming
 `action: "foo"` can only ever reach a method literally named `cmd_foo`, never
 arbitrary plugin internals.
 
-File paths passed to `krita_save` / `krita_open_file` are **not** sandboxed — your
-MCP client is trusted to choose them, like any agent with disk access. Previews
-from `krita_ai_save_preview` and exports from `krita_get_canvas` land in
-`CANVAS_OUTPUT_DIR`.
+File paths passed to `kri save` / `kri open` are **not** sandboxed — whoever
+runs the CLI is trusted to choose them, like any agent with disk access.
+Previews from `kri ai preview` land in `CANVAS_OUTPUT_DIR`; `kri look` images
+land at `/tmp/kri-canvas.jpg` (or `-o`).
 
 ---
 
@@ -474,10 +493,10 @@ from `krita_ai_save_preview` and exports from `krita_get_canvas` land in
   with no extra locking.
 - **Job lifecycle.** `model.generate()` returns right after enqueuing; the actual
   diffusion runs on AI Diffusion's asyncio loop and reports back via signals.
-  There is no built-in "wait until done" — the client polls `model.jobs` via
-  `krita_ai_list_jobs`.
+  There is no built-in "wait until done" in the plugin — `kri ai generate --wait`
+  does the polling client-side so the assistant doesn't have to.
 - **Graceful degradation.** Model/architecture resolution is best-effort: if
-  AI Diffusion's API has drifted, or you're offline, `krita_ai_status` still
+  AI Diffusion's API has drifted, or you're offline, `kri ai status` still
   returns a usable payload with `model.available = false` rather than erroring.
 
 ---
