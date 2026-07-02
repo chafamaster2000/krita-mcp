@@ -185,6 +185,20 @@ class KriTest(unittest.TestCase):
                 self.assertEqual(f.read(), b"fakeimagebytes")
         self.assertEqual(self.last_request()["params"]["mode"], "fast")
 
+    def test_look_default_path_uses_system_tempdir(self):
+        """Sin -o ni KRI_LOOK_PATH, el default cae en tempfile.gettempdir()
+        (no en /tmp hardcodeado, que no existe en Windows)."""
+        FakePlugin.responses["get_canvas"] = self._canvas_payload()
+        env = dict(os.environ, KRITA_URL=f"http://localhost:{self.port}")
+        env.pop("KRI_LOOK_PATH", None)
+        r = subprocess.run([sys.executable, KRI, "look"],
+                           capture_output=True, text=True, env=env, timeout=30)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        path = json.loads(r.stdout)["path"]
+        self.assertEqual(os.path.dirname(path), tempfile.gettempdir())
+        self.assertTrue(os.path.isfile(path))
+        os.remove(path)
+
     def test_look_full_mode(self):
         FakePlugin.responses["get_canvas"] = self._canvas_payload(fmt="png")
         with tempfile.TemporaryDirectory() as d:

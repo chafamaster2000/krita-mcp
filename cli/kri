@@ -16,6 +16,7 @@ import base64
 import json
 import os
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -86,7 +87,8 @@ def look_path(payload, override):
     if override:
         return override
     ext = "png" if payload.get("format") == "png" else "jpg"
-    return os.environ.get("KRI_LOOK_PATH") or f"/tmp/kri-canvas.{ext}"
+    return os.environ.get("KRI_LOOK_PATH") or os.path.join(
+        tempfile.gettempdir(), f"kri-canvas.{ext}")
 
 
 def parse_points(tokens):
