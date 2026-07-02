@@ -1,27 +1,29 @@
 #!/usr/bin/env python3
 """kri — CLI bridge to the kritamcp plugin running inside Krita.
 
-JSON-over-HTTP to the plugin (default http://localhost:5678). Stdlib only,
-so every invocation starts fast and there is no venv.
+JSON-over-HTTP to the plugin (default http://127.0.0.1:5678 — the literal
+IP dodges Windows' 2s localhost->IPv6 fallback). Stdlib only, so every
+invocation starts fast and there is no venv.
 
 Env:
-  KRITA_URL       plugin endpoint (default http://localhost:5678)
+  KRITA_URL       plugin endpoint (default http://127.0.0.1:5678)
   KRITAMCP_TOKEN  shared token; must match the token set in Krita's env
   KRI_LOOK_PATH   override the default image path used by `kri look`
 
 Exit codes: 0 ok · 1 plugin/connection error · 2 usage error.
 """
 import argparse
-import base64
 import json
 import os
+import socket
 import sys
-import tempfile
 import time
-import urllib.error
-import urllib.request
 
-KRITA_URL = os.environ.get("KRITA_URL", "http://localhost:5678")
+# base64/tempfile solo los usa `look` → import lazy en write_image/look_path.
+# urllib.request costaba ~+55ms por invocación; el transporte es un socket
+# crudo (el plugin habla HTTP plano en localhost, controlamos ambos lados).
+
+KRITA_URL = os.environ.get("KRITA_URL", "http://127.0.0.1:5678")
 TOKEN = os.environ.get("KRITAMCP_TOKEN", "")
 
 WORKSPACES = ["generation", "upscaling", "live", "animation", "custom"]
@@ -33,29 +35,62 @@ CONTROL_MODES = [
 ]
 
 
+def _endpoint():
+    """host, port, base_path from KRITA_URL (no urllib.parse: too heavy)."""
+    rest = KRITA_URL.split("://", 1)[-1]
+    hostport, _, path = rest.partition("/")
+    host, _, port = hostport.partition(":")
+    return host, int(port or 80), "/" + path if path else ""
+
+
+def http_request(method, path, body=None, timeout=30.0):
+    """Minimal HTTP/1.1 over a raw socket. `Connection: close` + read-to-EOF
+    keeps it correct against both HTTP/1.0 and 1.1 servers. Returns the
+    parsed JSON body regardless of status code (the plugin puts errors in
+    the body), or an {"error": ...} dict on transport failure."""
+    host, port, base = _endpoint()
+    lines = [
+        f"{method} {(base + path) or '/'} HTTP/1.1",
+        f"Host: {host}:{port}",
+        "Connection: close",
+        "Content-Type: application/json",
+    ]
+    if TOKEN:
+        lines.append(f"X-Kritamcp-Token: {TOKEN}")
+    payload = body if body is not None else b""
+    lines.append(f"Content-Length: {len(payload)}")
+    raw = ("\r\n".join(lines) + "\r\n\r\n").encode() + payload
+    try:
+        with socket.create_connection((host, port), timeout=timeout) as s:
+            s.sendall(raw)
+            chunks = []
+            while True:
+                chunk = s.recv(65536)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+    except (ConnectionError, socket.gaierror, socket.timeout, OSError) as e:
+        return {"error": (f"Cannot connect to Krita at {KRITA_URL} — is Krita "
+                          f"running with the kritamcp plugin? ({e})")}
+    response = b"".join(chunks)
+    head, _, resp_body = response.partition(b"\r\n\r\n")
+    try:
+        status = int(head.split(None, 2)[1])
+    except (IndexError, ValueError):
+        return {"error": f"Malformed HTTP response from plugin at {KRITA_URL}"}
+    try:
+        return json.loads(resp_body.decode())
+    except Exception:
+        return {"error": f"HTTP {status} from plugin (non-JSON body)"}
+
+
 def send(action, params=None, timeout=30.0):
     """POST one command. The timeout also travels in the body so the plugin
     stops waiting just before we would (same contract server.py used)."""
     body = json.dumps(
         {"action": action, "params": params or {}, "timeout": timeout}
     ).encode()
-    headers = {"Content-Type": "application/json"}
-    if TOKEN:
-        headers["X-Kritamcp-Token"] = TOKEN
-    req = urllib.request.Request(KRITA_URL, data=body, headers=headers)
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            return json.loads(r.read().decode())
-    except urllib.error.HTTPError as e:
-        try:
-            return json.loads(e.read().decode())
-        except Exception:
-            return {"error": f"HTTP {e.code} from plugin"}
-    except urllib.error.URLError as e:
-        return {"error": (f"Cannot connect to Krita at {KRITA_URL} — is Krita "
-                          f"running with the kritamcp plugin? ({e.reason})")}
-    except Exception as e:
-        return {"error": str(e)}
+    return http_request("POST", "", body, timeout=timeout)
 
 
 def out(result):
@@ -76,6 +111,7 @@ def clean(**params):
 
 def write_image(payload, path):
     """Decode a plugin canvas payload (data_b64) to a file; return summary."""
+    import base64
     raw = base64.b64decode(payload["data_b64"])
     with open(path, "wb") as f:
         f.write(raw)
@@ -87,8 +123,10 @@ def look_path(payload, override):
     if override:
         return override
     ext = "png" if payload.get("format") == "png" else "jpg"
-    return os.environ.get("KRI_LOOK_PATH") or os.path.join(
-        tempfile.gettempdir(), f"kri-canvas.{ext}")
+    if os.environ.get("KRI_LOOK_PATH"):
+        return os.environ["KRI_LOOK_PATH"]
+    import tempfile
+    return os.path.join(tempfile.gettempdir(), f"kri-canvas.{ext}")
 
 
 def parse_points(tokens):
@@ -113,13 +151,7 @@ def read_source(file_arg):
 # ----- handlers -----
 
 def cmd_health(a):
-    headers = {"X-Kritamcp-Token": TOKEN} if TOKEN else {}
-    req = urllib.request.Request(f"{KRITA_URL}/health", headers=headers)
-    try:
-        with urllib.request.urlopen(req, timeout=5) as r:
-            out(json.loads(r.read().decode()))
-    except Exception as e:
-        out({"error": f"Cannot connect to Krita at {KRITA_URL}: {e}"})
+    out(http_request("GET", "/health", timeout=5))
 
 
 def cmd_status(a):
