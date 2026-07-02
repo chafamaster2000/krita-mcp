@@ -9,6 +9,11 @@ description: Usar SIEMPRE que haya que controlar Krita desde Claude Code — pin
 Todo comando imprime JSON. Error → exit 1, así que las cadenas `&&` cortan solas.
 `kri --help` y `kri <cmd> --help` listan todo.
 
+**Un turno = una invocación de Bash, no un comando kri.** Encadená con `&&`
+todo lo que no dependa de leer un output intermedio: acción + verificación
+viajan juntas (`kri batch <<EOF ... EOF && kri ai status`). Solo cortá el
+turno cuando necesitás LEER el resultado para decidir el paso siguiente.
+
 ## Reglas de oro (minimizar turnos)
 
 1. **`kri status` solo cuando el estado existente importa** — trabajar sobre un
@@ -85,9 +90,18 @@ falta. Piso ideal: 1 batch + 1 batch de corrección = 2 turnos.
 Trabajar sobre un documento existente o con AI: `kri status` primero, después
 el batch.
 
-Configurar AI y generar:
+Configurar AI (estilo + prompt + verificación = UN turno):
 ```bash
-kri ai set-params --style "flux-dev" && kri ai status   # re-leer architecture
-kri ai set-prompt -p "..." -n "..."                      # formateado a la familia
+kri batch <<'EOF' && kri ai status
+[{"action": "ai_set_params", "params": {"style": "flux-dev"}},
+ {"action": "ai_set_prompt", "params": {"positive": "...", "negative": "..."}}]
+EOF
+```
+La convención de prompt de la familia NUEVA sale del nombre/filename del
+estilo (Tabla B de krita-ai-prompt-format) — no hace falta un turno aparte
+para re-leer `architecture` antes de escribir el prompt.
+
+Generar (después de configurar):
+```bash
 kri ai generate --wait && kri ai apply && kri look
 ```
