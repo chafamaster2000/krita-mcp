@@ -39,8 +39,28 @@ Prompt a pegar (idéntico en ambas corridas):
 
 | Corrida | Fecha | Turnos | Minutos | Notas |
 |---|---|---|---|---|
-| MCP | | | | |
-| kri | | | | |
+| MCP | 2026-07-01 | 3 | ~1.4 | subagente; new_canvas + 2 batch |
+| kri (skill v1) | 2026-07-01 | 5 | ~3.7 | subagente; status + exec(rechazado) + 2 batch + look — 2 turnos desperdiciados |
+| kri (skill v2) | 2026-07-01 | 2 | ~1.5 | subagente; 2× batch+look fast — piso teórico del flujo dibujar→mirar→corregir→mirar |
+
+> Metodología: no fue sesión fresca real; se usó un subagente de contexto limpio
+> por interfaz (mismo prompt del Test 2), corridos en secuencia contra el mismo
+> Krita. n=1 por corrida, alta varianza.
+>
+> **Corrida 1 (skill v1): kri 167% de MCP.** Causa: la skill forzaba
+> `status`-first (overhead en canvas en blanco) y el agente probó `exec`
+> (compuerta lo rechazó). Se iteró la skill: status solo cuando el estado
+> existente/AI importa, exec nunca para dibujar, no duplicar look tras
+> `--look fast`, guía para triángulos compuestos.
+>
+> **Corrida 2 (skill v2): kri 2 turnos = 67% de MCP.** Mejor que MCP en
+> absoluto, pero no llega al ≤50% del criterio. Ojo: 2 turnos es el piso
+> teórico de este test (1 batch dibujo + 1 batch corrección, ambos con
+> `--look fast`), y el piso de MCP es ~2-3 también — el target ≤50% no es
+> alcanzable en Test 2 porque ambas interfaces baten cerca del piso. El
+> veredicto de la migración debería apoyarse en Test 1 (config AI), donde el
+> MCP histórico encadenaba muchas tools sueltas. Test 1 pendiente: AI
+> Diffusion desconectado en esta máquina (`ai: "Conexión rechazada"`).
 
 ---
 
