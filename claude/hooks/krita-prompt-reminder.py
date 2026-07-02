@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
-"""PreToolUse hook for the krita-mcp prompt workflow.
+"""PreToolUse hook (matcher: Bash) for the kri prompt workflow.
 
-Fires before krita_ai_set_prompt and krita_ai_generate. It calls the Krita bridge
-itself (localhost:5678 ai_status), reads the active style's resolved architecture,
-and injects a reminder naming the model family + prompt convention so the active
-model is enforced even if the skills aren't loaded in context.
+Fires on every Bash call. Exits silently (no output at all) unless the
+command touches the AI prompt: `kri ai set-prompt` / `kri ai generate`, or
+`ai_set_prompt` / `ai_generate` inside a `kri batch` heredoc. When it
+matches, it reads the active style's resolved architecture from the plugin
+(action ai_status on localhost:5678) and injects a reminder naming the model
+family + prompt convention.
 
-Reminder-only: never blocks. Any failure degrades to a generic reminder. The
-output is PreToolUse `additionalContext` (added to the model's context, not shown
-to the user as a block)."""
+Reminder-only: never blocks; any failure degrades to a generic reminder."""
 import sys
 import os
 import json
@@ -61,7 +61,8 @@ def model_line():
     info = ARCH.get(arch)
     if info:
         fam, conv, neg = info
-        return f"Modelo activo: architecture='{arch}' ({fam}). Convención del positivo: {conv}. Negativo: {neg}. "
+        return (f"Modelo activo: architecture='{arch}' ({fam}). "
+                f"Convención del positivo: {conv}. Negativo: {neg}. ")
     if arch in ("sdxl", "sd15"):
         return (
             f"Modelo activo: architecture='{arch}' (AMBIGUO: SDXL/SD1.5 corre tanto "
@@ -78,24 +79,35 @@ def main():
         data = json.loads(sys.stdin.read() or "{}")
     except Exception:
         data = {}
-    tool = data.get("tool_name", "")
+    command = (data.get("tool_input") or {}).get("command", "")
 
-    if "generate" in tool:
-        base = (
+    # Fast path: not a kri prompt command → no output, no HTTP call.
+    if "kri" not in command:
+        return
+    has_set_prompt = "ai set-prompt" in command or "ai_set_prompt" in command
+    has_generate = "ai generate" in command or "ai_generate" in command
+    if not (has_set_prompt or has_generate):
+        return
+
+    parts = []
+    if has_set_prompt:
+        parts.append(
+            "Antes de escribir este prompt usá: krita-ai-prompt-format (formatear "
+            "según el modelo activo), e image-prompt-unknown-entities (googlear "
+            "nombres propios no famosos antes de describirlos)."
+        )
+    if has_generate:
+        parts.append(
             "Antes de generar: corré image-prompt-sanity-check sobre el prompt final "
             "(coherencia con el modelo activo y con lo que pidió el usuario; restos de "
             "ediciones, contradicciones, score tags si la familia los pide, negativo, "
             "nombres propios resueltos)."
         )
-    else:  # set_prompt
-        base = (
-            "Antes de escribir este prompt usá: krita-ai-prompt-format (formatear según "
-            "el modelo activo), e image-prompt-unknown-entities (googlear nombres propios "
-            "no famosos antes de describirlos)."
-        )
+    base = " ".join(parts)
 
     line = model_line()
-    msg = (line + base) if line else (base + " (No pude leer ai_status; verificá el modelo activo vos.)")
+    msg = (line + base) if line else (
+        base + " (No pude leer ai_status; verificá el modelo activo vos.)")
 
     print(json.dumps({
         "hookSpecificOutput": {
